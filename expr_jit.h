@@ -1,6 +1,37 @@
 #pragma once
 #include <stdint.h>
 
+#define EXPR_JIT_COMPILER_MSVC		(0)
+#define EXPR_JIT_COMPILER_CLANG		(0)
+#define EXPR_JIT_COMPILER_GCC		(0)
+
+#if defined(__clang__)
+	#undef EXPR_JIT_COMPILER_CLANG
+	#define EXPR_JIT_COMPILER_CLANG (1)
+#elif defined(__GNUG__)
+	#undef EXPR_JIT_COMPILER_GCC	
+	#define EXPR_JIT_COMPILER_GCC	(1)
+#elif defined(_MSC_VER)
+	#undef EXPR_JIT_COMPILER_MSVC
+	#define EXPR_JIT_COMPILER_MSVC	(1)
+#else
+	#error Compiler could not be detected.
+#endif
+
+#if (EXPR_JIT_COMPILER_CLANG || EXPR_JIT_COMPILER_GCC)
+	#define EXPR_JIT_UNREACHABLE __builtin_unreachable();
+#elif EXPR_JIT_COMPILER_MSVC
+	#define EXPR_JIT_UNREACHABLE __assume(0);
+#else
+	#error Compiler not supported.
+#endif
+
+#ifndef EXPR_JIT_ASSERT
+	#include <assert.h>
+	#define EXPR_JIT_ASSERT(_expr) assert((_expr))
+#endif
+
+
 namespace expr_jit
 {
 
@@ -46,5 +77,7 @@ inline float expr_jit_eval(void const* _code_ptr, float const* _args)
 	using expr_fn = float(*)(float const* _args);
 	return (expr_fn(_code_ptr))(_args);
 }
+
+float expr_eval(expr const* _expr, float const* _args);
 
 } // namespace expr_jit

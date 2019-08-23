@@ -1,4 +1,3 @@
-#include <assert.h>
 #include <malloc.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -6,6 +5,7 @@
 #include <stdarg.h>
 
 #include "expr_jit.h"
+
 
 namespace expr_jit
 {
@@ -224,6 +224,30 @@ struct expr
 
 	void free_ast_node(ast_node* _node)
 	{
+		if (!_node)
+		{
+			return;
+		}
+
+		switch (_node->type)
+		{
+			case ast_node_type::bin_add:
+			case ast_node_type::bin_sub:
+			case ast_node_type::bin_mul:
+			case ast_node_type::bin_div:
+			{
+				free_ast_node(_node->binary_op.left);
+				free_ast_node(_node->binary_op.right);
+			} break;
+
+			case ast_node_type::un_neg:
+			{
+				free_ast_node(_node->unary_child);
+			} break;
+
+			default: {} break;
+		}
+
 		alloc.free(alloc.ctx, _node);
 	}
 
@@ -420,6 +444,7 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	{
 		neg_node = _parser.expression->alloc_ast_node();
 		neg_node->type = ast_node_type::un_neg;
+		lex_next(_lexer);
 	}
 
 	switch (_lexer.peek.type)
@@ -468,6 +493,11 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 			}
 			return node;
 		} break;
+	}
+
+	if (neg_node)
+	{
+		_parser.expression->free_ast_node(neg_node);
 	}
 
 	return nullptr;
@@ -565,7 +595,8 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	// Init peek.
 	lex_next(lexer);
 
-	if (!parse_expr_ast(parser, lexer))
+	expression->root = parse_expr_ast(parser, lexer);
+	if (!expression->root)
 	{
 		// TODO: Free expr.
 		return nullptr;
@@ -583,6 +614,61 @@ void free_expression(expr* _expr)
 
 	// TODO: Free any internal structures.
 	_expr->alloc.free(_expr->alloc.ctx, _expr);
+}
+
+float eval_node(ast_node const* _node, float const* _args)
+{
+	switch (_node->type)
+	{
+		case ast_node_type::bin_add:
+		{
+			return eval_node(_node->binary_op.left, _args) + eval_node(_node->binary_op.right, _args);
+		} break;
+
+		case ast_node_type::bin_sub:
+		{
+			return eval_node(_node->binary_op.left, _args) - eval_node(_node->binary_op.right, _args);
+		} break;
+
+		case ast_node_type::bin_mul:
+		{
+			return eval_node(_node->binary_op.left, _args) * eval_node(_node->binary_op.right, _args);
+		} break;
+
+		case ast_node_type::bin_div:
+		{
+			return eval_node(_node->binary_op.left, _args) / eval_node(_node->binary_op.right, _args);
+		} break;
+
+		case ast_node_type::un_neg:
+		{
+			return -eval_node(_node->unary_child, _args);
+		} break;
+	
+		case ast_node_type::variable:
+		{
+			return _args[_node->variable_idx];
+		} break;
+
+		case ast_node_type::constant:
+		{
+			return _node->constant_val;
+		} break;
+
+		default:
+		{
+			EXPR_JIT_ASSERT(false);
+		} break;
+	}
+
+	
+	EXPR_JIT_UNREACHABLE;
+}
+
+float expr_eval(expr const* _expr, float const* _args)
+{
+	EXPR_JIT_ASSERT(_expr && _expr->root);
+	return eval_node(_expr->root, _args);
 }
 
 } // namespace expr_jit
