@@ -100,6 +100,7 @@ struct symbol_table
 		{
 			if (hashes[idx] == 0)
 			{
+				hashes[idx] = hash;
 				symbol* sym = &symbols[idx];
 				sym->str = _str;
 				sym->str_len = uint32_t(strlen(_str));
@@ -116,7 +117,7 @@ struct symbol_table
 
 	symbol* find(char const* _str, uint32_t _str_len)
 	{
-		uint32_t const hash = fnv1a(_str);
+		uint32_t const hash = fnv1a(_str, _str_len);
 		uint32_t idx = hash & count_mask;
 
 		for (;;)
@@ -181,10 +182,54 @@ struct symbol_table
 	uint32_t count_mask = 0;
 };
 
+enum class ast_node_type
+{
+	constant,
+	variable,
+
+	bin_add,
+	bin_sub,
+	bin_mul,
+	bin_div,
+
+	un_neg
+};
+
+struct ast_node
+{
+	ast_node_type type;
+
+	union
+	{
+		float constant_val;
+		uint32_t variable_idx;
+
+		struct
+		{
+			ast_node* left;
+			ast_node* right;
+		} binary_op;
+
+		ast_node* unary_child;
+	};
+};
+
 
 struct expr
 {
+	ast_node* alloc_ast_node()
+	{
+		return (ast_node*)alloc.alloc(alloc.ctx, sizeof(ast_node));
+	}
+
+	void free_ast_node(ast_node* _node)
+	{
+		alloc.free(alloc.ctx, _node);
+	}
+
 	alloc_hooks alloc;
+
+	ast_node* root = nullptr;
 };
 
 
@@ -217,8 +262,6 @@ enum class token_type
 	divide,
 	multiply,
 
-	symbol,
-
 	eof
 };
 
@@ -230,7 +273,7 @@ struct token
 	{
 		float constant_val;
 		uint32_t variable_idx;
-		symbol* symbol;
+		symbol* sym;
 	};
 };
 
@@ -322,9 +365,28 @@ bool lex_next(lexer_ctx& _ctx)
 						output_error(_ctx.error_cb, "Found undeclared symbol: \"%.*s\".", uint32_t(_ctx.cur - str_begin), str_begin);
 						return false;
 					}
+					
+					switch (sym->type)
+					{
+						case symbol_type::constant:
+						{
+							_ctx.peek.type = token_type::constant;
+							_ctx.peek.constant_val = sym->constant_val;
+						} break;
 
-					_ctx.peek.type = token_type::symbol;
-					_ctx.peek.symbol = sym;
+						case symbol_type::variable:
+						{
+							_ctx.peek.type = token_type::variable;
+							_ctx.peek.variable_idx = sym->variable_idx;
+						} break;
+
+						default:
+						{
+							assert(false);
+							return false;
+						};
+					}
+
 					return true;
 				}
 
@@ -335,10 +397,137 @@ bool lex_next(lexer_ctx& _ctx)
 	} while (true);
 }
 
-
-static bool parse_expr_internal(parser_ctx& _parser, lexer_ctx& _lexer)
+bool lex_expect(lexer_ctx& _lexer, token_type _type)
 {
-	return false;
+	if (_lexer.peek.type != _type)
+	{
+		return false;
+	}
+
+	lex_next(_lexer);
+	return true;
+}
+
+static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer);
+static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer);
+static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer);
+
+static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
+{
+	// factor -> [-] constant | variable | (expr)
+	ast_node* neg_node = nullptr;
+	if (_lexer.peek.type == token_type::minus)
+	{
+		neg_node = _parser.expression->alloc_ast_node();
+		neg_node->type = ast_node_type::un_neg;
+	}
+
+	switch (_lexer.peek.type)
+	{
+		case token_type::variable:
+		{
+			ast_node* node = _parser.expression->alloc_ast_node();
+			node->type = ast_node_type::variable;
+			node->variable_idx = _lexer.peek.variable_idx;	
+			lex_next(_lexer);
+			if (neg_node)
+			{
+				neg_node->unary_child = node;
+				return neg_node;
+			}
+			return node;
+		} break;
+
+		case token_type::constant:
+		{
+			ast_node* node = _parser.expression->alloc_ast_node();
+			node->type = ast_node_type::constant;
+			node->constant_val = _lexer.peek.constant_val;
+			lex_next(_lexer);
+			if (neg_node)
+			{
+				neg_node->unary_child = node;
+				return neg_node;
+			}
+			return node;
+		} break;
+
+		case token_type::left_paren:
+		{
+			lex_next(_lexer);
+			ast_node* node = parse_expr_ast(_parser, _lexer);
+			if (!node || !lex_expect(_lexer, token_type::right_paren))
+			{
+				_parser.expression->free_ast_node(node);
+				return nullptr;
+			}
+			if (neg_node)
+			{
+				neg_node->unary_child = node;
+				return neg_node;
+			}
+			return node;
+		} break;
+	}
+
+	return nullptr;
+}
+
+static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer)
+{
+	// term -> term * factor | term / factor | factor
+
+	ast_node* node = parse_factor_ast(_parser, _lexer);
+	if (!node)
+	{
+		return nullptr;
+	}
+
+	while (_lexer.peek.type == token_type::divide
+		   || _lexer.peek.type == token_type::multiply)
+	{
+		token const tok = _lexer.peek;
+		lex_next(_lexer);
+		ast_node* bin_op = _parser.expression->alloc_ast_node();
+		bin_op->type = tok.type == token_type::divide ? ast_node_type::bin_div : ast_node_type::bin_mul;
+		bin_op->binary_op.left = node;
+		bin_op->binary_op.right = parse_factor_ast(_parser, _lexer);
+		
+		if (!bin_op->binary_op.right)
+		{
+			_parser.expression->free_ast_node(bin_op);
+			return nullptr;
+		}
+		node = bin_op;
+	}
+	return node;
+}
+
+static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
+{
+	// expr -> expr + term | expr - term | term
+
+	ast_node* node = parse_term_ast(_parser, _lexer);
+
+	
+	while (_lexer.peek.type == token_type::plus
+		   || _lexer.peek.type == token_type::minus)
+	{
+		token const tok = _lexer.peek;
+		lex_next(_lexer);
+		ast_node* bin_op = _parser.expression->alloc_ast_node();
+		bin_op->type = tok.type == token_type::plus ? ast_node_type::bin_add : ast_node_type::bin_sub;
+		bin_op->binary_op.left = node;
+		bin_op->binary_op.right = parse_term_ast(_parser, _lexer);
+		if (!bin_op->binary_op.right)
+		{
+			_parser.expression->free_ast_node(bin_op);
+			return nullptr;
+		}
+		node = bin_op;
+	}
+
+	return node;
 }
 
 expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= nullptr*/, alloc_hooks* _alloc_hooks /*= nullptr*/)
@@ -376,7 +565,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	// Init peek.
 	lex_next(lexer);
 
-	if (!parse_expr_internal(parser, lexer))
+	if (!parse_expr_ast(parser, lexer))
 	{
 		// TODO: Free expr.
 		return nullptr;
