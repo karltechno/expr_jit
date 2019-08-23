@@ -210,7 +210,7 @@ struct ast_node
 			ast_node* right;
 		} binary_op;
 
-		ast_node* unary_child;
+		ast_node* unary_op_child;
 	};
 };
 
@@ -242,7 +242,7 @@ struct expr
 
 			case ast_node_type::un_neg:
 			{
-				free_ast_node(_node->unary_child);
+				free_ast_node(_node->unary_op_child);
 			} break;
 
 			default: {} break;
@@ -326,7 +326,7 @@ static char to_lower(char c)
 	return c >= 'A' && c <= 'Z' ? c + 'a' - 'A' : c;
 }
 
-bool lex_next(lexer_ctx& _ctx)
+static bool lex_next(lexer_ctx& _ctx)
 {
 	do 
 	{
@@ -345,6 +345,7 @@ bool lex_next(lexer_ctx& _ctx)
 			case '+': _ctx.peek.type = token_type::plus; ++_ctx.cur; return true;
 			case '*': _ctx.peek.type = token_type::multiply; ++_ctx.cur; return true;
 			case '-': _ctx.peek.type = token_type::minus; ++_ctx.cur; return true;
+			case '/': _ctx.peek.type = token_type::divide; ++_ctx.cur; return true;
 
 			case '0':
 			case '1':
@@ -406,7 +407,7 @@ bool lex_next(lexer_ctx& _ctx)
 
 						default:
 						{
-							assert(false);
+							EXPR_JIT_ASSERT(false);
 							return false;
 						};
 					}
@@ -421,7 +422,7 @@ bool lex_next(lexer_ctx& _ctx)
 	} while (true);
 }
 
-bool lex_expect(lexer_ctx& _lexer, token_type _type)
+static bool lex_expect(lexer_ctx& _lexer, token_type _type)
 {
 	if (_lexer.peek.type != _type)
 	{
@@ -440,67 +441,58 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 {
 	// factor -> [-] constant | variable | (expr)
 	ast_node* neg_node = nullptr;
+	ast_node* factor_node = nullptr;
+
 	if (_lexer.peek.type == token_type::minus)
 	{
+		lex_next(_lexer);
 		neg_node = _parser.expression->alloc_ast_node();
 		neg_node->type = ast_node_type::un_neg;
-		lex_next(_lexer);
 	}
 
 	switch (_lexer.peek.type)
 	{
 		case token_type::variable:
 		{
-			ast_node* node = _parser.expression->alloc_ast_node();
-			node->type = ast_node_type::variable;
-			node->variable_idx = _lexer.peek.variable_idx;	
 			lex_next(_lexer);
-			if (neg_node)
-			{
-				neg_node->unary_child = node;
-				return neg_node;
-			}
-			return node;
+			factor_node = _parser.expression->alloc_ast_node();
+			factor_node->type = ast_node_type::variable;
+			factor_node->variable_idx = _lexer.peek.variable_idx;
 		} break;
 
 		case token_type::constant:
 		{
-			ast_node* node = _parser.expression->alloc_ast_node();
-			node->type = ast_node_type::constant;
-			node->constant_val = _lexer.peek.constant_val;
 			lex_next(_lexer);
-			if (neg_node)
-			{
-				neg_node->unary_child = node;
-				return neg_node;
-			}
-			return node;
+			factor_node = _parser.expression->alloc_ast_node();
+			factor_node->type = ast_node_type::constant;
+			factor_node->constant_val = _lexer.peek.constant_val;
 		} break;
 
 		case token_type::left_paren:
 		{
 			lex_next(_lexer);
-			ast_node* node = parse_expr_ast(_parser, _lexer);
-			if (!node || !lex_expect(_lexer, token_type::right_paren))
+			factor_node = parse_expr_ast(_parser, _lexer);
+			if (!factor_node || !lex_expect(_lexer, token_type::right_paren))
 			{
-				_parser.expression->free_ast_node(node);
-				return nullptr;
+				_parser.expression->free_ast_node(factor_node);
+				factor_node = nullptr;
 			}
-			if (neg_node)
-			{
-				neg_node->unary_child = node;
-				return neg_node;
-			}
-			return node;
+
 		} break;
 	}
 
-	if (neg_node)
+	if (factor_node && neg_node)
+	{
+		neg_node->unary_op_child = factor_node;
+		return neg_node;
+	}
+
+	if (!factor_node)
 	{
 		_parser.expression->free_ast_node(neg_node);
 	}
 
-	return nullptr;
+	return factor_node;
 }
 
 static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer)
@@ -538,7 +530,6 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	// expr -> expr + term | expr - term | term
 
 	ast_node* node = parse_term_ast(_parser, _lexer);
-
 	
 	while (_lexer.peek.type == token_type::plus
 		   || _lexer.peek.type == token_type::minus)
@@ -558,6 +549,97 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	}
 
 	return node;
+}
+
+static void optimize_fold_constants(expr* _expr, ast_node* _node)
+{
+	// Walk depth first post and fold constants.
+	switch (_node->type)
+	{
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_sub:
+		case ast_node_type::bin_mul:
+		case ast_node_type::bin_div:
+		{
+			ast_node* left_node = _node->binary_op.left;
+			ast_node* right_node = _node->binary_op.right;
+
+			optimize_fold_constants(_expr, left_node);
+			optimize_fold_constants(_expr, right_node);
+
+			if (_node->binary_op.left->type == ast_node_type::constant
+				&& _node->binary_op.right->type == ast_node_type::constant)
+			{
+				switch (_node->type)
+				{
+					case ast_node_type::bin_add: _node->constant_val = _node->binary_op.left->constant_val + _node->binary_op.right->constant_val; break;
+					case ast_node_type::bin_sub: _node->constant_val = _node->binary_op.left->constant_val - _node->binary_op.right->constant_val; break;
+					case ast_node_type::bin_mul: _node->constant_val = _node->binary_op.left->constant_val * _node->binary_op.right->constant_val; break;
+					case ast_node_type::bin_div: _node->constant_val = _node->binary_op.left->constant_val / _node->binary_op.right->constant_val; break;
+				}
+
+				_node->type = ast_node_type::constant;
+				_expr->free_ast_node(left_node);
+				_expr->free_ast_node(right_node);
+			}
+			
+		} break;
+
+
+		case ast_node_type::un_neg:
+		{
+			ast_node* child = _node->unary_op_child;
+			optimize_fold_constants(_expr, child);
+			if (_node->unary_op_child->type == ast_node_type::constant)
+			{
+				_node->constant_val = -child->constant_val;
+				_node->type = ast_node_type::constant;
+				_expr->free_ast_node(child);
+			}
+		} break;
+
+		default:
+		{
+		} break;
+	}
+}
+
+static void optimize_strength_reduction(expr* _expr, ast_node* _node)
+{
+	switch (_node->type)
+	{
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_sub:
+		case ast_node_type::bin_mul:
+		case ast_node_type::bin_div:
+		{
+			ast_node* left_node = _node->binary_op.left;
+			ast_node* right_node = _node->binary_op.right;
+
+			optimize_strength_reduction(_expr, left_node);
+			optimize_strength_reduction(_expr, right_node);
+
+			if (_node->type == ast_node_type::bin_div)
+			{
+				// Replace (x / constant) with (x * (1/constant))
+				if (_node->binary_op.right->type == ast_node_type::constant)
+				{
+					_node->binary_op.right->constant_val = 1.0f / _node->binary_op.right->constant_val;
+					_node->type = ast_node_type::bin_mul;
+				}
+			}
+
+		} break;
+
+		case ast_node_type::un_neg:
+		{
+			optimize_strength_reduction(_expr, _node);
+		} break;
+
+		default:
+		{
+		} break;
+	}
 }
 
 expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= nullptr*/, alloc_hooks* _alloc_hooks /*= nullptr*/)
@@ -598,9 +680,12 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	expression->root = parse_expr_ast(parser, lexer);
 	if (!expression->root)
 	{
-		// TODO: Free expr.
+		free_expression(expression);
 		return nullptr;
 	}
+	
+	optimize_fold_constants(expression, expression->root);
+	optimize_strength_reduction(expression, expression->root);
 
 	return expression;
 }
@@ -612,7 +697,7 @@ void free_expression(expr* _expr)
 		return;
 	}
 
-	// TODO: Free any internal structures.
+	_expr->free_ast_node(_expr->root);
 	_expr->alloc.free(_expr->alloc.ctx, _expr);
 }
 
@@ -642,7 +727,7 @@ float eval_node(ast_node const* _node, float const* _args)
 
 		case ast_node_type::un_neg:
 		{
-			return -eval_node(_node->unary_child, _args);
+			return -eval_node(_node->unary_op_child, _args);
 		} break;
 	
 		case ast_node_type::variable:
@@ -663,6 +748,12 @@ float eval_node(ast_node const* _node, float const* _args)
 
 	
 	EXPR_JIT_UNREACHABLE;
+}
+
+bool is_expr_constant(expr const* _expr)
+{
+	EXPR_JIT_ASSERT(_expr && _expr->root);
+	return _expr->root->type == ast_node_type::constant;
 }
 
 float expr_eval(expr const* _expr, float const* _args)

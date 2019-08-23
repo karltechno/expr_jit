@@ -78,6 +78,10 @@ inline float expr_jit_eval(void const* _code_ptr, float const* _args)
 	return (expr_fn(_code_ptr))(_args);
 }
 
+// Evaluate expression by walking the AST.
 float expr_eval(expr const* _expr, float const* _args);
+
+// Returns whether the expression is constant.
+bool is_expr_constant(expr const* _expr);
 
 } // namespace expr_jit
