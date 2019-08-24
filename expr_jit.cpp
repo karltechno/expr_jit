@@ -321,6 +321,7 @@ enum class ast_node_type
 struct ast_node
 {
 	bool is_constant() const { return type == ast_node_type::constant; }
+	bool is_constant_or_var() const { return type == ast_node_type::constant || type == ast_node_type::variable; }
 
 	ast_node_type type;
 
@@ -386,6 +387,7 @@ struct expr
 
 	alloc_hooks alloc;
 	ast_node_pool node_pool;
+	uint32_t num_variables;
 
 	ast_node* root = nullptr;
 };
@@ -794,6 +796,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	expr* expression = (expr*)hooks.alloc(hooks.ctx, sizeof(expr));
 	memset(expression, 0, sizeof(expr));
 	expression->alloc = hooks;
+	expression->num_variables = _info.num_variables;
 
 	parser_ctx parser;
 	parser.init(expression, &_info, err_cb);
@@ -1003,8 +1006,14 @@ struct constant_info
 {
 	uint32_t value;
 	uint32_t uses;
-	xmm_reg cur_reg = xmm_reg::num_reg;
-	bool is_16b = false;
+	xmm_reg cur_reg;
+	bool is_16b;
+};
+
+struct variable_info
+{
+	uint32_t uses;
+	xmm_reg cur_reg;
 };
 
 struct x64_writer_ctx
@@ -1078,6 +1087,14 @@ struct x64_writer_ctx
 
 		constants.init(_expr->alloc);
 		rip_disp32_relocs.init(_expr->alloc);
+		variables.init(_expr->alloc);
+		variables.append_n(_expr->num_variables);
+
+		for (variable_info& var_info : variables)
+		{
+			var_info.cur_reg = xmm_reg::num_reg;
+			var_info.uses = 0;
+		}
 	}
 
 	void write_u32(uint32_t _v)
@@ -1137,6 +1154,7 @@ struct x64_writer_ctx
 	register_allocator reg_alloc;
 
 	dyn_pod_array<constant_info> constants;
+	dyn_pod_array<variable_info> variables;
 	dyn_pod_array<constant_relocation> rip_disp32_relocs;
 
 	uint8_t* buff_begin;
@@ -1324,7 +1342,87 @@ static void x64_ret(x64_writer_ctx& _writer)
 	_writer.write_u8(0xc3);
 }
 
-void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
+static operand_location load_constant_or_var(x64_writer_ctx& _writer, ast_node* _node, xmm_reg* o_reg_to_free)
+{
+	// TODO: we should cache constant index from pre-pass.
+	xmm_reg* reg = nullptr;
+	uint32_t* uses = nullptr;
+
+	operand_location ret_loc;
+
+	*o_reg_to_free = xmm_reg::num_reg;
+
+	EXPR_JIT_ASSERT(_node->is_constant_or_var());
+
+	uint32_t constant_idx = 0;
+
+	if (_node->is_constant())
+	{
+		float const constant_val = _node->constant_val;
+		constant_idx = _writer.get_constant_index(constant_val);
+		constant_info& const_info = _writer.constants[constant_idx];
+		EXPR_JIT_ASSERT(const_info.uses > 0);
+		reg = &const_info.cur_reg;
+		uses = &const_info.uses;
+	}
+	else
+	{
+		EXPR_JIT_ASSERT(_node->type == ast_node_type::variable);
+		variable_info& var_info = _writer.variables[_node->variable_idx];
+		reg = &var_info.cur_reg;
+		uses = &var_info.uses;
+	}
+
+
+	if (*reg != xmm_reg::num_reg)
+	{
+		// constant already in a register - make use of it.
+		ret_loc.set_as_xmm(*reg);
+		if (*uses == 0)
+		{
+			*o_reg_to_free = *reg;
+			*reg = xmm_reg::num_reg;
+		}
+	}
+	else
+	{
+		if (--(*uses) > 0)
+		{
+			// There is another use of this constant/var, so lets try and load it into a register.
+			// TODO: Broken with spill.
+			ret_loc = _writer.reg_alloc.alloc_reg();
+			*reg = ret_loc.reg;
+			operand_location src_loc;
+
+			if (_node->is_constant())
+			{
+				src_loc.set_as_constant(constant_idx);
+			}
+			else
+			{
+				src_loc.set_as_arg(_node->variable_idx);
+			}
+
+			x64_movss(_writer, ret_loc, src_loc);
+		}
+		else
+		{
+			// address it directly.
+			if (_node->is_constant())
+			{
+				ret_loc.set_as_constant(constant_idx);
+			}
+			else
+			{
+				ret_loc.set_as_arg(_node->variable_idx);
+			}
+		}
+	}
+
+	return ret_loc;
+}
+
+static void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
 {
 	switch (_node->type)
 	{
@@ -1341,7 +1439,7 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 			ast_node* left_node = _node->binary_op.left;
 			ast_node* right_node = _node->binary_op.right;
 
-			if (left_node->is_constant() && _node->type != ast_node_type::bin_div)
+			if (left_node->is_constant_or_var() && _node->type != ast_node_type::bin_div)
 			{
 				// If constant is on left hand side and the binary operator is commutative then switch them round.
 				// Eg if expression would be like so: mulss [constant], [expr]
@@ -1350,49 +1448,9 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 			}
 
 			// Look for optimizations for putting constant in re-usable register or directly addressing in instruction.
-			if (right_node->is_constant())
+			if (right_node->is_constant_or_var())
 			{
-				// TODO: we should cache constant index from pre-pass.
-				float const constant_val = right_node->constant_val;
-				uint32_t const constant_idx = _writer.get_constant_index(constant_val);
-				constant_info& const_info = _writer.constants[constant_idx];
-				EXPR_JIT_ASSERT(const_info.uses > 0);
-
-				if (const_info.cur_reg != xmm_reg::num_reg)
-				{
-					// constant already in a register - make use of it.
-					right_op.set_as_xmm(const_info.cur_reg);
-					if (--const_info.uses == 0)
-					{
-						xmm_reg_to_free = const_info.cur_reg;
-						const_info.cur_reg = xmm_reg::num_reg;
-					}
-				}
-				else
-				{
-					if (--const_info.uses > 0)
-					{
-						// There is another use of this constant, so lets try and load it into a register.
-						right_op = _writer.reg_alloc.alloc_reg();
-						const_info.cur_reg = right_op.reg;
-						operand_location constant_loc;
-						constant_loc.set_as_constant(constant_idx);
-						if (!const_info.is_16b)
-						{
-							x64_movss(_writer, right_op, constant_loc);
-						}
-						else
-						{
-							// TODO
-							EXPR_JIT_ASSERT(false);
-						}
-					}
-					else
-					{
-						// address it directly.
-						right_op.set_as_constant(constant_idx);
-					}
-				}
+				right_op = load_constant_or_var(_writer, right_node, &xmm_reg_to_free);
 			}
 			else
 			{
@@ -1463,6 +1521,11 @@ static void build_constant_usage_info(x64_writer_ctx& _writer, ast_node* _root)
 		{
 			uint32_t const idx = _writer.get_constant_index_128(c_sign_bit);
 			++_writer.constants[idx].uses;
+		}
+		else if (_node->type == ast_node_type::variable)
+		{
+			EXPR_JIT_ASSERT(_node->variable_idx < _writer.variables.size);
+			++_writer.variables[_node->variable_idx].uses;
 		}
 	});
 }
