@@ -66,10 +66,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb = nullpt
 void free_expression(expr* _expr);
 
 // Jit expression to x64. Returns amount of bytes that were written, or would have been if _buff_size was too small.
-uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size);
-
-// Size in bytes needed to jit this expression.
-uint32_t jit_expr_x64_size(expr const* _expr);
+uint32_t jit_expr_x64(expr const* _expr, void* _buff, uint32_t _buff_size);
 
 inline float expr_jit_eval(void const* _code_ptr, float const* _args)
 {

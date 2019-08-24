@@ -152,9 +152,9 @@ struct dyn_pod_array
 
 	T* append_n(uint32_t _n)
 	{
-		ensure_cap(size + n);
+		ensure_cap(size + _n);
 		T* ptr = mem + size;
-		size += n;
+		size += _n;
 		return ptr;
 	}
 
@@ -742,7 +742,7 @@ static void optimize_strength_reduction(expr* _expr, ast_node* _node)
 
 		case ast_node_type::un_neg:
 		{
-			optimize_strength_reduction(_expr, _node);
+			optimize_strength_reduction(_expr, _node->unary_op_child);
 		} break;
 
 		default:
@@ -967,13 +967,6 @@ struct register_allocator
 	uint32_t free_reg_mask = (1 << xmm_reg::num_reg) - 1;
 };
 
-enum builtin_constants
-{
-	sign_bit,
-
-	total_constants
-};
-
 struct constant_relocation
 {
 	uint8_t* rip;
@@ -984,6 +977,37 @@ struct constant_relocation
 struct x64_writer_ctx
 {
 	uint32_t get_constant_index(float _constant)
+	{
+		uint32_t constu32;
+		memcpy(&constu32, &_constant, sizeof(uint32_t));
+		return get_constant_index(constu32);
+	}
+
+	uint32_t get_constant_index_128(uint32_t _constant)
+	{
+		uint32_t const u4[4] = { _constant, _constant, _constant, _constant };
+		for (uint32_t i = 0; i < constants.size / 4; ++i)
+		{
+			if (memcmp(&constants[i], u4, sizeof(uint32_t) * 4) == 0)
+			{
+				return i * 4;
+			}
+		}
+
+		// Align to 16 bytes.
+		if (uint32_t const align_offs = ((constants.size + 15) & ~15) - constants.size)
+		{
+			constants.append_n(align_offs);
+		}
+
+		uint32_t const idx = constants.size;
+
+
+		memcpy(constants.append_n(4), u4, sizeof(uint32_t) * 4);
+		return idx;
+	}
+
+	uint32_t get_constant_index(uint32_t _constant)
 	{
 		for (uint32_t i = 0; i < constants.size; ++i)
 		{
@@ -1033,11 +1057,16 @@ struct x64_writer_ctx
 
 	void write_constants_and_relocate()
 	{
-		uint8_t* reloc_base = buff_cur;
-		for (float f : constants)
+		// align to 16 bytes
+		while (uintptr_t(buff_cur) & 0xf)
 		{
-			uint32_t u;
-			memcpy(&u, &f, sizeof(float));
+			write_u8(0);
+		}
+
+		uint8_t* reloc_base = buff_cur;
+
+		for (uint32_t u : constants)
+		{
 			write_u32(u);
 		}
 
@@ -1060,7 +1089,7 @@ struct x64_writer_ctx
 
 	register_allocator reg_alloc;
 
-	dyn_pod_array<float> constants;
+	dyn_pod_array<uint32_t> constants;
 	dyn_pod_array<constant_relocation> rip_disp32_relocs;
 
 	uint8_t* buff_begin;
@@ -1088,12 +1117,15 @@ static bool operand_requires_rex_prefix(operand_location const& _operand)
 	return _operand.is_register() && _operand.reg > xmm7;
 }
 
-static void x64_sse_binary_op(x64_writer_ctx& _writer, operand_location const& _op0, operand_location const& _op1, uint8_t _instruction_prefix)
+static void x64_sse_binary_op(x64_writer_ctx& _writer, operand_location const& _op0, operand_location const& _op1, uint8_t _instruction_prefix, bool _sse_ps = false)
 {
 	EXPR_JIT_ASSERT(_op1.is_register());
 
-	// sse prefix first
-	_writer.write_u8(x64_prefix::sse_f32);
+	if (!_sse_ps)
+	{
+		// sse prefix first
+		_writer.write_u8(x64_prefix::sse_f32);
+	}
 
 	uint8_t rex_byte = 0;
 
@@ -1234,6 +1266,12 @@ static void x64_subss(x64_writer_ctx& _writer, operand_location const& _dest, op
 	x64_sse_binary_op(_writer, _src, _dest, 0x5c);
 }
 
+static void x64_xorps(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x57, true);
+}
+
 static void x64_ret(x64_writer_ctx& _writer)
 {
 	_writer.write_u8(0xc3);
@@ -1250,7 +1288,8 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 		case ast_node_type::bin_mul:
 		case ast_node_type::bin_div:
 		{
-			operand_location const right_op = _writer.reg_alloc.alloc_reg();
+			operand_location right_op = _writer.reg_alloc.alloc_reg();
+
 			jit_expr_x64_build_from_ast(_writer, _node->binary_op.left, _dest);
 			jit_expr_x64_build_from_ast(_writer, _node->binary_op.right, right_op);
 
@@ -1262,16 +1301,16 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 				case ast_node_type::bin_div: x64_divss(_writer, _dest, right_op); break;
 			}
 			_writer.reg_alloc.set_reg_unused(right_op.reg);
-
 		} break;
 
 		case ast_node_type::un_neg:
 		{
-			// TODO
-			EXPR_JIT_ASSERT(false);
-			//jit_expr_x64_build_from_ast(_writer, _node->unary_op_child->unary_op_child, _dest);
-			// Now negate the dest register 
-			// pxor reg, [c_sign_bit]
+			jit_expr_x64_build_from_ast(_writer, _node->unary_op_child, _dest);
+
+			uint32_t constexpr sign_bit = 0x80000000;
+			operand_location const_loc;
+			const_loc.set_as_constant(_writer.get_constant_index_128(sign_bit));
+			x64_xorps(_writer, _dest, const_loc);
 		} break;
 
 		case ast_node_type::variable:
@@ -1296,13 +1335,13 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 	}
 }
 
-uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size)
+uint32_t jit_expr_x64(expr const* _expr, void* _buff, uint32_t _buff_size)
 {
 	EXPR_JIT_ASSERT(_expr);
 	EXPR_JIT_ASSERT(_buff);
 	
 	x64_writer_ctx asm_writer;
-	asm_writer.init(_expr, _buff, _buff_size);
+	asm_writer.init(_expr, (uint8_t*)_buff, _buff_size);
 
 	operand_location ret_loc;
 	ret_loc.set_as_xmm(xmm_reg::xmm0);
