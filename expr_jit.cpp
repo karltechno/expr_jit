@@ -843,6 +843,7 @@ float expr_eval(expr const* _expr, float const* _args)
 
 // X64 Codegen.
 
+
 enum xmm_reg
 {
 	xmm0,
@@ -867,13 +868,45 @@ enum xmm_reg
 
 struct operand_location
 {
-	bool is_on_stack() const
+	enum class operand_type
 	{
-		return reg == xmm_reg::num_reg;
+		xmm,
+		constant,
+		arg_offset
+	};
+
+	void set_as_xmm(xmm_reg _reg)
+	{
+		reg = _reg;
+		type = operand_type::xmm;
 	}
 
-	uint32_t stack_offset;
+	void set_as_arg(uint32_t _arg_idx)
+	{
+		arg_index = _arg_idx;
+		type = operand_type::arg_offset;
+	}
+
+	void set_as_constant(uint32_t _constant_idx)
+	{
+		type = operand_type::constant;
+		constant_idx = _constant_idx;
+	}
+
+	bool is_register() const
+	{
+		return type == operand_type::xmm;;
+	}
+
+	operand_type type;
+
 	xmm_reg reg;
+
+	union
+	{
+		uint32_t constant_idx;
+		uint32_t arg_index;
+	};
 };
 
 struct register_allocator
@@ -892,7 +925,9 @@ struct register_allocator
 		{
 			if (available_regs[i])
 			{
-				return operand_location{ 0, xmm_reg(i) };
+				operand_location loc;
+				loc.set_as_xmm(xmm_reg(i));
+				return loc;
 			}
 		}
 
@@ -910,6 +945,13 @@ enum builtin_constants
 	total_constants
 };
 
+struct constant_relocation
+{
+	uint8_t* rip;
+	uint8_t* constant_write_loc;
+	uint32_t constant_idx;
+};
+
 struct x64_writer_ctx
 {
 	uint32_t get_constant_index(float _constant)
@@ -920,11 +962,11 @@ struct x64_writer_ctx
 			{
 				return i;
 			}
-
-			uint32_t const idx = constants.size;
-			constants.append(_constant);
-			return idx;
 		}
+
+		uint32_t const idx = constants.size;
+		constants.append(_constant);
+		return idx;
 	}
 
 	void init(expr const* _expr, uint8_t* _buff, size_t _buff_size)
@@ -936,7 +978,7 @@ struct x64_writer_ctx
 		bytes_written = 0;
 
 		constants.init(_expr->alloc);
-		
+		rip_disp32_relocs.init(_expr->alloc);
 	}
 
 	void write_u32(uint32_t _v)
@@ -946,6 +988,7 @@ struct x64_writer_ctx
 			memcpy(buff_cur, &_v, sizeof(uint32_t));
 		}
 
+		buff_cur += sizeof(uint32_t);
 		bytes_written += sizeof(uint32_t);
 	}
 
@@ -959,58 +1002,251 @@ struct x64_writer_ctx
 		++bytes_written;
 	}
 
+	void write_constants_and_relocate()
+	{
+		uint8_t* reloc_base = buff_cur;
+		for (float f : constants)
+		{
+			uint32_t u;
+			memcpy(&u, &f, sizeof(float));
+			write_u32(u);
+		}
+
+		for (constant_relocation& reloc : rip_disp32_relocs)
+		{
+			uint8_t* const abs_address = reloc_base + reloc.constant_idx * sizeof(float);
+			EXPR_JIT_ASSERT(abs_address > reloc.rip);
+			uintptr_t const offset = abs_address - reloc.rip;
+			EXPR_JIT_ASSERT(offset <= INT32_MAX);
+
+			if (buff_end - reloc.constant_write_loc >= 4)
+			{
+				int32_t const offs32 = int32_t(offset);
+				memcpy(reloc.constant_write_loc, &offs32, sizeof(int32_t));
+			}
+		}
+	}
+
 	expr const* expr;
 
 	dyn_pod_array<float> constants;
+	dyn_pod_array<constant_relocation> rip_disp32_relocs;
 
 	uint8_t* buff_begin;
 	uint8_t* buff_cur;
 	uint8_t* buff_end;
 
-	size_t bytes_written;
+	uint32_t bytes_written;
 
 	void* write_ctx;
 };
 
-void jit_expr_x64_write_asm(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
+namespace x64_prefix
+{
+
+enum : uint8_t
+{
+	sse_f32 = 0xF3,
+	two_byte_opcode = 0x0F
+};
+
+} // namespace x64_prefix
+
+static bool operand_requires_rex_prefix(operand_location const& _operand)
+{
+	return _operand.is_register() && _operand.reg > xmm7;
+}
+
+static void x64_sse_binary_op(x64_writer_ctx& _writer, operand_location const& _op0, operand_location const& _op1, uint8_t _instruction_prefix)
+{
+	EXPR_JIT_ASSERT(_op1.is_register());
+
+	// sse prefix first
+	_writer.write_u8(x64_prefix::sse_f32);
+
+	uint8_t rex_byte = 0;
+
+	if (operand_requires_rex_prefix(_op0))
+	{
+		// REX.B
+		rex_byte |= 0b0001;
+	}
+
+	if (operand_requires_rex_prefix(_op1))
+	{
+		// REX.R
+		rex_byte |= 0b1000;
+	}
+
+	// Rex prefix if necessary.
+	if (rex_byte)
+	{
+		_writer.write_u8(0x40 | rex_byte);
+	}
+
+	// Two byte opcode prefix.
+	_writer.write_u8(x64_prefix::two_byte_opcode);
+
+	_writer.write_u8(_instruction_prefix);
+
+	// ModR/M byte.
+	{
+		uint8_t rm;
+		uint32_t displacement = 0;
+		uint8_t mod;
+		
+		bool displace_is_32_bit;
+
+		constant_relocation* reloc = nullptr;
+		
+		switch (_op0.type)
+		{
+			case operand_location::operand_type::xmm:
+			{
+				mod = 0x3;
+				rm = uint8_t(_op0.reg > xmm7 ? _op0.reg - 8 : _op0.reg);
+			} break;
+
+			case operand_location::operand_type::arg_offset:
+			{
+				// win64 - args in RCX. 
+				// TODO: other calling conventions.
+				rm = 0x1;
+
+				if (_op0.arg_index == 0)
+				{
+					// [RCX]
+					mod = 0x0;
+				}
+				else
+				{
+					// [RCX + disp]
+					displacement = _op0.arg_index * sizeof(float);
+					mod = displacement > 255 ? 0x2 : 0x1;
+					displace_is_32_bit = displacement > 255;
+				}
+			} break;
+
+			case operand_location::operand_type::constant:
+			{
+				// [RIP + disp32]
+				mod = 0x0;
+				rm = 0x5;
+				displacement = UINT32_MAX;
+				displace_is_32_bit = true;
+				reloc = _writer.rip_disp32_relocs.append();
+				reloc->constant_idx = _op0.constant_idx;
+			} break;
+		}
+
+		uint8_t const reg = uint8_t(_op1.reg > xmm7 ? _op1.reg - 8 : _op1.reg);
+		_writer.write_u8(rm | (reg << 3) | (mod << 6));
+
+		if (displacement)
+		{
+			if (reloc)
+			{
+				reloc->constant_write_loc = _writer.buff_cur;
+			}
+
+			if (displace_is_32_bit)
+			{
+				_writer.write_u32(displacement);
+			}
+			else
+			{
+				_writer.write_u8(displacement);
+			}
+
+			if (reloc)
+			{
+				reloc->rip = _writer.buff_cur;
+			}
+		}
+	}
+}
+
+static void x64_movss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	if (!_dest.is_register())
+	{
+		EXPR_JIT_ASSERT(_src.is_register());
+		x64_sse_binary_op(_writer, _dest, _src, 0x11);
+	}
+	else
+	{
+		x64_sse_binary_op(_writer, _src, _dest, 0x10);
+	}
+}
+
+static void x64_mulss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _dest, _src, 0x59);
+}
+
+static void x64_divss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _dest, _src, 0x5e);
+}
+
+static void x64_addss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x58);
+}
+
+static void x64_subss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _dest, _src, 0x5c);
+}
+
+static void x64_ret(x64_writer_ctx& _writer)
+{
+	_writer.write_u8(0xc3);
+}
+
+void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
 {
 	// Depth first - post order walk AST and generate code.
 
-	//switch (_node->type)
-	//{
-	//	case ast_node_type::bin_sub:
-	//	case ast_node_type::bin_add:
-	//	case ast_node_type::bin_mul:
-	//	case ast_node_type::bin_div:
-	//	{
+	switch (_node->type)
+	{
+		case ast_node_type::bin_sub:
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_mul:
+		case ast_node_type::bin_div:
+		{
 
-	//		return eval_node(_node->binary_op.left, _args) + eval_node(_node->binary_op.right, _args);
-	//	} break;
+			//return eval_node(_node->binary_op.left, _args) + eval_node(_node->binary_op.right, _args);
+		} break;
 
-	//	case ast_node_type::un_neg:
-	//	{
-	//		jit_expr_x64_write_asm(_writer, _node->unary_op_child->unary_op_child, _dest);
-	//		// Now negate the dest register 
-	//		// pxor reg, [c_sign_bit]
-	//	} break;
+		case ast_node_type::un_neg:
+		{
+			jit_expr_x64_build_from_ast(_writer, _node->unary_op_child->unary_op_child, _dest);
+			// Now negate the dest register 
+			// pxor reg, [c_sign_bit]
+		} break;
 
-	//	case ast_node_type::variable:
-	//	{
-	//		// TODO: Load to reg.
-	//		_node->variable_idx;
-	//	} break;
+		case ast_node_type::variable:
+		{
+			// TODO: Load to reg.
+			_node->variable_idx;
+		} break;
 
-	//	case ast_node_type::constant:
-	//	{
-	//		// TODO: Load constant to reg.
-	//		uint32_t const const_idx = _writer.get_constant_index(_node->constant_val);
-	//	} break;
+		case ast_node_type::constant:
+		{
+			// TODO: Load constant to reg.
+			uint32_t const const_idx = _writer.get_constant_index(_node->constant_val);
+		} break;
 
-	//	default:
-	//	{
-	//		EXPR_JIT_ASSERT(false);
-	//	} break;
-	//}
+		default:
+		{
+			EXPR_JIT_ASSERT(false);
+		} break;
+	}
 }
 
 uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size)
@@ -1020,7 +1256,22 @@ uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size)
 	
 	x64_writer_ctx asm_writer;
 	asm_writer.init(_expr, _buff, _buff_size);
-	return 0;
+	operand_location ret_reg;
+	ret_reg.set_as_xmm(xmm_reg::xmm0);
+	
+	operand_location arg;
+	arg.set_as_arg(0);
+
+	operand_location const0;
+	const0.set_as_constant(asm_writer.get_constant_index(2.0f));
+
+	x64_movss(asm_writer, ret_reg, const0);
+	x64_addss(asm_writer, ret_reg, arg);
+	x64_ret(asm_writer);
+	
+	asm_writer.write_constants_and_relocate();
+
+	return asm_writer.bytes_written;
 }
 
 

@@ -12,6 +12,14 @@ static bool float_rel_equal(float _lhs, float _rhs, float _minAbs, float _relTol
 	return fabsf(_lhs - _rhs) <= tol;
 }
 
+void* alloc_writeable_executable_page()
+{
+	void* p = ::VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	DWORD oldprotect;
+	::VirtualProtect(p, 4096, PAGE_EXECUTE_READWRITE, &oldprotect);
+	return p;
+}
+
 UTEST(constant_fold, fold1)
 {
 	expr_jit::expression_info info = {};
@@ -23,6 +31,12 @@ UTEST(constant_fold, fold1)
 	ASSERT_TRUE(expr_jit::is_expr_constant(expr));
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, nullptr) == -16.0f);
+
+	void* code = alloc_writeable_executable_page();
+	expr_jit::jit_expr_x64(expr, (uint8_t*)code, 4096);
+	float args[] = { 2.5f };
+	float const val = expr_jit::expr_jit_eval(code, args);
+
 	expr_jit::free_expression(expr);
 }
 
