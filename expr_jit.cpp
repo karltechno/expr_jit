@@ -1104,7 +1104,8 @@ struct x64_writer_ctx
 	void write_constants_and_relocate()
 	{
 		// align to 16 bytes
-		while (uintptr_t(buff_cur) & 0xf)
+		uintptr_t bytes_to_16b_align = ((uintptr_t(buff_cur) + 15) & ~15) - uintptr_t(buff_cur);
+		while (bytes_to_16b_align--)
 		{
 			write_u8(0);
 		}
