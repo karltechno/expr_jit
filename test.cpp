@@ -23,6 +23,7 @@ UTEST(constant_fold, fold1)
 	ASSERT_TRUE(expr_jit::is_expr_constant(expr));
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, nullptr) == -16.0f);
+	expr_jit::free_expression(expr);
 }
 
 UTEST(constant_fold, fold2)
@@ -36,6 +37,7 @@ UTEST(constant_fold, fold2)
 	ASSERT_TRUE(expr_jit::is_expr_constant(expr));
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, nullptr) == 55.0f);
+	expr_jit::free_expression(expr);
 }
 
 UTEST(constant_fold, fold3)
@@ -49,6 +51,7 @@ UTEST(constant_fold, fold3)
 	ASSERT_TRUE(expr_jit::is_expr_constant(expr));
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, nullptr) == 0.0f);
+	expr_jit::free_expression(expr);
 }
 
 UTEST(generic_expr, expr1)
@@ -68,6 +71,7 @@ UTEST(generic_expr, expr1)
 	float args[] = { 5.0f };
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == 55.0f);
+	expr_jit::free_expression(expr);
 }
 
 UTEST(generic_expr, expr2)
@@ -89,6 +93,7 @@ UTEST(generic_expr, expr2)
 	float const val = (((args[0] + 1.0f) * (args[1] / 2.0f)) * (args[2] + 1.0f));
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == val);
+	expr_jit::free_expression(expr);
 }
 
 UTEST_MAIN();

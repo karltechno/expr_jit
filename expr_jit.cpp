@@ -68,6 +68,87 @@ static void output_error(error_cb _err, char const* _fmt, ...)
 	va_end(args);
 }
 
+template <typename T>
+struct dyn_pod_array
+{
+	dyn_pod_array() = default;
+
+	~dyn_pod_array()
+	{
+		if (mem)
+		{
+			hooks.free(hooks.ctx, mem);
+		}
+	}
+
+	dyn_pod_array(dyn_pod_array const&) = delete;
+	dyn_pod_array& operator&(dyn_pod_array const&) = delete;
+
+	void init(alloc_hooks _hooks)
+	{
+		hooks = _hooks;
+	}
+
+	void ensure_cap(uint32_t _req_cap)
+	{
+		if (cap < _req_cap)
+		{
+			uint32_t const amortized_grow = cap + cap / 2;
+			uint32_t const new_cap = amortized_grow < _req_cap ? _req_cap : amortized_grow;
+			
+			T* new_mem = (T*)hooks.alloc(hooks.ctx, sizeof(T) * new_cap);
+			
+			if (mem)
+			{
+				memcpy(new_mem, mem, size * sizeof(T));
+				hooks.free(hooks.ctx, mem);
+			}
+			cap = new_cap;
+			mem = new_mem;
+		}
+	}
+
+	void append(T const& _v)
+	{
+		*append() = _v;
+	}
+
+	T* append()
+	{
+		ensure_cap(size + 1);
+		return &mem[size++];
+	}
+
+	T* append_n(uint32_t _n)
+	{
+		ensure_cap(size + n);
+		T* ptr = mem + size;
+		size += n;
+		return ptr;
+	}
+
+	T* begin()
+	{
+		return mem;
+	}
+
+	T* end()
+	{
+		return mem + size;
+	}
+
+	T& operator[](uint32_t _idx)
+	{
+		EXPR_JIT_ASSERT(_idx < size);
+		return mem[size];
+	}
+
+	T* mem = nullptr;
+	uint32_t size = 0;
+	uint32_t cap = 0;
+
+	alloc_hooks hooks;
+};
 
 enum class symbol_type
 {
@@ -214,44 +295,53 @@ struct ast_node
 	};
 };
 
+struct ast_node_pool
+{
+	static uint32_t const c_nodes_per_chunk = 32;
+	
+	struct chunk
+	{
+		chunk* next_chunk;
+		ast_node nodes[c_nodes_per_chunk];
+		uint32_t next_node;
+	};
+
+
+	void free_all(alloc_hooks _hooks)
+	{
+		chunk* c = chunk_list;
+		while (c)
+		{
+			chunk* next = c->next_chunk;
+			_hooks.free(_hooks.ctx, c);
+			c = next;
+		}
+	}
+
+	ast_node* alloc_node(alloc_hooks const& _hooks)
+	{
+		if (!chunk_list || chunk_list->next_node == c_nodes_per_chunk)
+		{
+			chunk* c = (chunk*)_hooks.alloc(_hooks.ctx, sizeof(chunk));
+			c->next_chunk = chunk_list;
+			chunk_list = c;
+			c->next_node = 0;
+		}
+		return &chunk_list->nodes[chunk_list->next_node++];
+	}
+
+	chunk* chunk_list;
+};
 
 struct expr
 {
 	ast_node* alloc_ast_node()
 	{
-		return (ast_node*)alloc.alloc(alloc.ctx, sizeof(ast_node));
-	}
-
-	void free_ast_node(ast_node* _node)
-	{
-		if (!_node)
-		{
-			return;
-		}
-
-		switch (_node->type)
-		{
-			case ast_node_type::bin_add:
-			case ast_node_type::bin_sub:
-			case ast_node_type::bin_mul:
-			case ast_node_type::bin_div:
-			{
-				free_ast_node(_node->binary_op.left);
-				free_ast_node(_node->binary_op.right);
-			} break;
-
-			case ast_node_type::un_neg:
-			{
-				free_ast_node(_node->unary_op_child);
-			} break;
-
-			default: {} break;
-		}
-
-		alloc.free(alloc.ctx, _node);
+		return node_pool.alloc_node(alloc);
 	}
 
 	alloc_hooks alloc;
+	ast_node_pool node_pool;
 
 	ast_node* root = nullptr;
 };
@@ -474,8 +564,7 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 			factor_node = parse_expr_ast(_parser, _lexer);
 			if (!factor_node || !lex_expect(_lexer, token_type::right_paren))
 			{
-				_parser.expression->free_ast_node(factor_node);
-				factor_node = nullptr;
+				return nullptr;
 			}
 
 		} break;
@@ -485,11 +574,6 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	{
 		neg_node->unary_op_child = factor_node;
 		return neg_node;
-	}
-
-	if (!factor_node)
-	{
-		_parser.expression->free_ast_node(neg_node);
 	}
 
 	return factor_node;
@@ -517,7 +601,6 @@ static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 		
 		if (!bin_op->binary_op.right)
 		{
-			_parser.expression->free_ast_node(bin_op);
 			return nullptr;
 		}
 		node = bin_op;
@@ -542,7 +625,6 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 		bin_op->binary_op.right = parse_term_ast(_parser, _lexer);
 		if (!bin_op->binary_op.right)
 		{
-			_parser.expression->free_ast_node(bin_op);
 			return nullptr;
 		}
 		node = bin_op;
@@ -579,12 +661,9 @@ static void optimize_fold_constants(expr* _expr, ast_node* _node)
 				}
 
 				_node->type = ast_node_type::constant;
-				_expr->free_ast_node(left_node);
-				_expr->free_ast_node(right_node);
 			}
 			
 		} break;
-
 
 		case ast_node_type::un_neg:
 		{
@@ -594,7 +673,6 @@ static void optimize_fold_constants(expr* _expr, ast_node* _node)
 			{
 				_node->constant_val = -child->constant_val;
 				_node->type = ast_node_type::constant;
-				_expr->free_ast_node(child);
 			}
 		} break;
 
@@ -621,7 +699,7 @@ static void optimize_strength_reduction(expr* _expr, ast_node* _node)
 
 			if (_node->type == ast_node_type::bin_div)
 			{
-				// Replace (x / constant) with (x * (1/constant))
+				// Replace division of constant with multiplication by reciprocal.
 				if (_node->binary_op.right->type == ast_node_type::constant)
 				{
 					_node->binary_op.right->constant_val = 1.0f / _node->binary_op.right->constant_val;
@@ -659,6 +737,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	error_cb err_cb = _error_cb ? _error_cb : null_err_cb;
 
 	expr* expression = (expr*)hooks.alloc(hooks.ctx, sizeof(expr));
+	memset(expression, 0, sizeof(expr));
 	expression->alloc = hooks;
 
 	parser_ctx parser;
@@ -697,7 +776,7 @@ void free_expression(expr* _expr)
 		return;
 	}
 
-	_expr->free_ast_node(_expr->root);
+	_expr->node_pool.free_all(_expr->alloc);
 	_expr->alloc.free(_expr->alloc.ctx, _expr);
 }
 
@@ -761,5 +840,189 @@ float expr_eval(expr const* _expr, float const* _args)
 	EXPR_JIT_ASSERT(_expr && _expr->root);
 	return eval_node(_expr->root, _args);
 }
+
+// X64 Codegen.
+
+enum xmm_reg
+{
+	xmm0,
+	xmm1,
+	xmm2,
+	xmm3,
+	xmm4,
+	xmm5,
+	xmm6,
+	xmm7,
+	xmm8,
+	xmm9,
+	xmm10,
+	xmm11,
+	xmm12,
+	xmm13,
+	xmm14,
+	xmm15,
+
+	num_reg
+};
+
+struct operand_location
+{
+	bool is_on_stack() const
+	{
+		return reg == xmm_reg::num_reg;
+	}
+
+	uint32_t stack_offset;
+	xmm_reg reg;
+};
+
+struct register_allocator
+{
+	register_allocator()
+	{
+		for (bool& b : available_regs)
+		{
+			b = true;
+		}
+	}	 
+
+	operand_location alloc_reg()
+	{
+		for (uint32_t i = 0; i < xmm_reg::num_reg; ++i)
+		{
+			if (available_regs[i])
+			{
+				return operand_location{ 0, xmm_reg(i) };
+			}
+		}
+
+		// TODO:
+		EXPR_JIT_ASSERT(false);
+	}
+
+	bool available_regs[xmm_reg::num_reg];
+};
+
+enum builtin_constants
+{
+	sign_bit,
+
+	total_constants
+};
+
+struct x64_writer_ctx
+{
+	uint32_t get_constant_index(float _constant)
+	{
+		for (uint32_t i = 0; i < constants.size; ++i)
+		{
+			if (constants[i] == _constant)
+			{
+				return i;
+			}
+
+			uint32_t const idx = constants.size;
+			constants.append(_constant);
+			return idx;
+		}
+	}
+
+	void init(expr const* _expr, uint8_t* _buff, size_t _buff_size)
+	{
+		expr = _expr;
+		buff_begin = _buff;
+		buff_cur = _buff;
+		buff_end = _buff + _buff_size;
+		bytes_written = 0;
+
+		constants.init(_expr->alloc);
+		
+	}
+
+	void write_u32(uint32_t _v)
+	{
+		if (buff_end - buff_cur >= sizeof(uint32_t))
+		{
+			memcpy(buff_cur, &_v, sizeof(uint32_t));
+		}
+
+		bytes_written += sizeof(uint32_t);
+	}
+
+	void write_u8(uint8_t _v)
+	{
+		if (buff_end != buff_cur)
+		{
+			*buff_cur++ = _v;
+		}
+
+		++bytes_written;
+	}
+
+	expr const* expr;
+
+	dyn_pod_array<float> constants;
+
+	uint8_t* buff_begin;
+	uint8_t* buff_cur;
+	uint8_t* buff_end;
+
+	size_t bytes_written;
+
+	void* write_ctx;
+};
+
+void jit_expr_x64_write_asm(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
+{
+	// Depth first - post order walk AST and generate code.
+
+	//switch (_node->type)
+	//{
+	//	case ast_node_type::bin_sub:
+	//	case ast_node_type::bin_add:
+	//	case ast_node_type::bin_mul:
+	//	case ast_node_type::bin_div:
+	//	{
+
+	//		return eval_node(_node->binary_op.left, _args) + eval_node(_node->binary_op.right, _args);
+	//	} break;
+
+	//	case ast_node_type::un_neg:
+	//	{
+	//		jit_expr_x64_write_asm(_writer, _node->unary_op_child->unary_op_child, _dest);
+	//		// Now negate the dest register 
+	//		// pxor reg, [c_sign_bit]
+	//	} break;
+
+	//	case ast_node_type::variable:
+	//	{
+	//		// TODO: Load to reg.
+	//		_node->variable_idx;
+	//	} break;
+
+	//	case ast_node_type::constant:
+	//	{
+	//		// TODO: Load constant to reg.
+	//		uint32_t const const_idx = _writer.get_constant_index(_node->constant_val);
+	//	} break;
+
+	//	default:
+	//	{
+	//		EXPR_JIT_ASSERT(false);
+	//	} break;
+	//}
+}
+
+uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size)
+{
+	EXPR_JIT_ASSERT(_expr);
+	EXPR_JIT_ASSERT(_buff);
+	
+	x64_writer_ctx asm_writer;
+	asm_writer.init(_expr, _buff, _buff_size);
+	return 0;
+}
+
+
 
 } // namespace expr_jit

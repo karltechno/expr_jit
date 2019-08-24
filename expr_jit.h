@@ -40,8 +40,6 @@ using error_cb = void(*)(char const* _err_str);
 using alloc_fn = void*(*)(void* _ctx, size_t _size);
 using free_fn = void(*)(void* _ctx, void* _ptr);
 
-using asm_write_fn = void(*)(void* _ctx, void const* _asm_ptr, uint32_t _size);
-
 struct expr;
 
 struct expression_info
@@ -67,7 +65,8 @@ struct alloc_hooks
 expr* parse_expression(expression_info const& _info, error_cb _error_cb = nullptr, alloc_hooks* _alloc_hooks = nullptr);
 void free_expression(expr* _expr);
 
-void jit_expr_x64(expr const* _expr, asm_write_fn _write_cb, void* _write_ctx);
+// Jit expression to x64. Returns amount of bytes that were written, or would have been if _buff_size was too small.
+uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size);
 
 // Size in bytes needed to jit this expression.
 uint32_t jit_expr_x64_size(expr const* _expr);
