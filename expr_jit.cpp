@@ -17,6 +17,9 @@ extern "C" unsigned char _BitScanReverse(unsigned long * _Index, unsigned long _
 namespace expr_jit
 {
 
+uint32_t constexpr c_sign_bit = 0x80000000;
+
+
 static void* malloc_wrapper(void*, size_t _size)
 {
 	return malloc(_size);
@@ -100,6 +103,14 @@ static void output_error(error_cb _err, char const* _fmt, ...)
 }
 
 template <typename T>
+void swap(T& _lhs, T& _rhs)
+{
+	T temp = _lhs;
+	_lhs = _rhs;
+	_rhs = temp;
+}
+
+template <typename T>
 struct dyn_pod_array
 {
 	dyn_pod_array() = default;
@@ -171,7 +182,7 @@ struct dyn_pod_array
 	T& operator[](uint32_t _idx)
 	{
 		EXPR_JIT_ASSERT(_idx < size);
-		return mem[size];
+		return mem[_idx];
 	}
 
 	T* mem = nullptr;
@@ -309,6 +320,8 @@ enum class ast_node_type
 
 struct ast_node
 {
+	bool is_constant() const { return type == ast_node_type::constant; }
+
 	ast_node_type type;
 
 	union
@@ -664,9 +677,9 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	return node;
 }
 
-static void optimize_fold_constants(expr* _expr, ast_node* _node)
+template <typename VisitFn>
+static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn const& _fn)
 {
-	// Walk depth first post and fold constants.
 	switch (_node->type)
 	{
 		case ast_node_type::bin_add:
@@ -677,58 +690,73 @@ static void optimize_fold_constants(expr* _expr, ast_node* _node)
 			ast_node* left_node = _node->binary_op.left;
 			ast_node* right_node = _node->binary_op.right;
 
-			optimize_fold_constants(_expr, left_node);
-			optimize_fold_constants(_expr, right_node);
-
-			if (_node->binary_op.left->type == ast_node_type::constant
-				&& _node->binary_op.right->type == ast_node_type::constant)
-			{
-				switch (_node->type)
-				{
-					case ast_node_type::bin_add: _node->constant_val = _node->binary_op.left->constant_val + _node->binary_op.right->constant_val; break;
-					case ast_node_type::bin_sub: _node->constant_val = _node->binary_op.left->constant_val - _node->binary_op.right->constant_val; break;
-					case ast_node_type::bin_mul: _node->constant_val = _node->binary_op.left->constant_val * _node->binary_op.right->constant_val; break;
-					case ast_node_type::bin_div: _node->constant_val = _node->binary_op.left->constant_val / _node->binary_op.right->constant_val; break;
-				}
-
-				_node->type = ast_node_type::constant;
-			}
-			
+			visit_ast_depth_first_post_order(left_node, _fn);
+			visit_ast_depth_first_post_order(right_node, _fn);
 		} break;
 
 		case ast_node_type::un_neg:
 		{
-			ast_node* child = _node->unary_op_child;
-			optimize_fold_constants(_expr, child);
-			if (_node->unary_op_child->type == ast_node_type::constant)
-			{
-				_node->constant_val = -child->constant_val;
-				_node->type = ast_node_type::constant;
-			}
+			visit_ast_depth_first_post_order(_node->unary_op_child, _fn);
 		} break;
 
 		default:
 		{
 		} break;
 	}
+
+	_fn(_node);
 }
 
-static void optimize_strength_reduction(expr* _expr, ast_node* _node)
+static void optimize_fold_constants(ast_node* _root)
 {
-	switch (_node->type)
+	visit_ast_depth_first_post_order(_root, [](ast_node* _node)
 	{
-		case ast_node_type::bin_add:
-		case ast_node_type::bin_sub:
-		case ast_node_type::bin_mul:
-		case ast_node_type::bin_div:
+		switch (_node->type)
 		{
-			ast_node* left_node = _node->binary_op.left;
-			ast_node* right_node = _node->binary_op.right;
+			case ast_node_type::bin_add:
+			case ast_node_type::bin_sub:
+			case ast_node_type::bin_mul:
+			case ast_node_type::bin_div:
+			{
+				if (_node->binary_op.left->type == ast_node_type::constant
+					&& _node->binary_op.right->type == ast_node_type::constant)
+				{
+					switch (_node->type)
+					{
+						case ast_node_type::bin_add: _node->constant_val = _node->binary_op.left->constant_val + _node->binary_op.right->constant_val; break;
+						case ast_node_type::bin_sub: _node->constant_val = _node->binary_op.left->constant_val - _node->binary_op.right->constant_val; break;
+						case ast_node_type::bin_mul: _node->constant_val = _node->binary_op.left->constant_val * _node->binary_op.right->constant_val; break;
+						case ast_node_type::bin_div: _node->constant_val = _node->binary_op.left->constant_val / _node->binary_op.right->constant_val; break;
+					}
 
-			optimize_strength_reduction(_expr, left_node);
-			optimize_strength_reduction(_expr, right_node);
+					_node->type = ast_node_type::constant;
+				}
 
-			if (_node->type == ast_node_type::bin_div)
+			} break;
+
+			case ast_node_type::un_neg:
+			{
+				if (_node->unary_op_child->type == ast_node_type::constant)
+				{
+					_node->constant_val = -_node->unary_op_child->constant_val;
+					_node->type = ast_node_type::constant;
+				}
+			} break;
+
+			default:
+			{
+			} break;
+		}
+	});
+}
+
+static void optimize_strength_reduction(ast_node* _root)
+{
+	visit_ast_depth_first_post_order(_root, [](ast_node* _node)
+	{
+		switch (_node->type)
+		{
+			case ast_node_type::bin_div:
 			{
 				// Replace division of constant with multiplication by reciprocal.
 				if (_node->binary_op.right->type == ast_node_type::constant)
@@ -736,19 +764,15 @@ static void optimize_strength_reduction(expr* _expr, ast_node* _node)
 					_node->binary_op.right->constant_val = 1.0f / _node->binary_op.right->constant_val;
 					_node->type = ast_node_type::bin_mul;
 				}
-			}
 
-		} break;
+			} break;
 
-		case ast_node_type::un_neg:
-		{
-			optimize_strength_reduction(_expr, _node->unary_op_child);
-		} break;
+			default:
+			{
+			} break;
+		}
+	});
 
-		default:
-		{
-		} break;
-	}
 }
 
 expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= nullptr*/, alloc_hooks* _alloc_hooks /*= nullptr*/)
@@ -794,8 +818,8 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 		return nullptr;
 	}
 	
-	optimize_fold_constants(expression, expression->root);
-	optimize_strength_reduction(expression, expression->root);
+	optimize_fold_constants(expression->root);
+	optimize_strength_reduction(expression->root);
 
 	return expression;
 }
@@ -901,6 +925,7 @@ struct operand_location
 {
 	enum class operand_type
 	{
+		invalid,
 		xmm,
 		constant,
 		arg_offset
@@ -926,10 +951,10 @@ struct operand_location
 
 	bool is_register() const
 	{
-		return type == operand_type::xmm;;
+		return type == operand_type::xmm;
 	}
 
-	operand_type type;
+	operand_type type = operand_type::invalid;
 
 	xmm_reg reg;
 
@@ -974,6 +999,14 @@ struct constant_relocation
 	uint32_t constant_idx;
 };
 
+struct constant_info
+{
+	uint32_t value;
+	uint32_t uses;
+	xmm_reg cur_reg = xmm_reg::num_reg;
+	bool is_16b = false;
+};
+
 struct x64_writer_ctx
 {
 	uint32_t get_constant_index(float _constant)
@@ -985,10 +1018,15 @@ struct x64_writer_ctx
 
 	uint32_t get_constant_index_128(uint32_t _constant)
 	{
-		uint32_t const u4[4] = { _constant, _constant, _constant, _constant };
 		for (uint32_t i = 0; i < constants.size / 4; ++i)
 		{
-			if (memcmp(&constants[i], u4, sizeof(uint32_t) * 4) == 0)
+			bool equal = true;
+			equal &= constants[i + 0].value	== _constant;
+			equal &= constants[i + 1].value == _constant;
+			equal &= constants[i + 2].value	== _constant;
+			equal &= constants[i + 3].value == _constant;
+
+			if (equal)
 			{
 				return i * 4;
 			}
@@ -1001,9 +1039,12 @@ struct x64_writer_ctx
 		}
 
 		uint32_t const idx = constants.size;
+		constant_info* info = constants.append_n(4);
+		info[0].value = info[1].value = info[2].value = info[3].value = _constant;
+		info->cur_reg = xmm_reg::num_reg;
+		info->uses = 0;
+		info->is_16b = true;
 
-
-		memcpy(constants.append_n(4), u4, sizeof(uint32_t) * 4);
 		return idx;
 	}
 
@@ -1011,14 +1052,19 @@ struct x64_writer_ctx
 	{
 		for (uint32_t i = 0; i < constants.size; ++i)
 		{
-			if (constants[i] == _constant)
+			if (constants[i].value == _constant)
 			{
 				return i;
 			}
-		}
+		}	
 
 		uint32_t const idx = constants.size;
-		constants.append(_constant);
+		constant_info* info = constants.append();
+		info->cur_reg = xmm_reg::num_reg;
+		info->uses = 0;
+		info->value = _constant;
+		info->is_16b = false;
+
 		return idx;
 	}
 
@@ -1065,9 +1111,9 @@ struct x64_writer_ctx
 
 		uint8_t* reloc_base = buff_cur;
 
-		for (uint32_t u : constants)
+		for (constant_info const& info : constants)
 		{
-			write_u32(u);
+			write_u32(info.value);
 		}
 
 		for (constant_relocation& reloc : rip_disp32_relocs)
@@ -1089,7 +1135,7 @@ struct x64_writer_ctx
 
 	register_allocator reg_alloc;
 
-	dyn_pod_array<uint32_t> constants;
+	dyn_pod_array<constant_info> constants;
 	dyn_pod_array<constant_relocation> rip_disp32_relocs;
 
 	uint8_t* buff_begin;
@@ -1279,8 +1325,6 @@ static void x64_ret(x64_writer_ctx& _writer)
 
 void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, operand_location _dest)
 {
-	// Depth first - post order walk AST and generate code.
-
 	switch (_node->type)
 	{
 		case ast_node_type::bin_sub:
@@ -1288,10 +1332,78 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 		case ast_node_type::bin_mul:
 		case ast_node_type::bin_div:
 		{
-			operand_location right_op = _writer.reg_alloc.alloc_reg();
+			xmm_reg xmm_reg_to_free = xmm_reg::num_reg;
 
-			jit_expr_x64_build_from_ast(_writer, _node->binary_op.left, _dest);
-			jit_expr_x64_build_from_ast(_writer, _node->binary_op.right, right_op);
+			operand_location left_op = _dest;
+			operand_location right_op;
+
+			ast_node* left_node = _node->binary_op.left;
+			ast_node* right_node = _node->binary_op.right;
+
+			if (left_node->is_constant() && _node->type != ast_node_type::bin_div)
+			{
+				// If constant is on left hand side and the binary operator is commutative then switch them round.
+				// Eg if expression would be like so: mulss [constant], [expr]
+				// Then swap it so we have mulss [expr], [constant] so we can directly evaluate [expr] in dest register and address constant in same instruction.
+				swap(left_node, right_node);
+			}
+
+			// Look for optimizations for putting constant in re-usable register or directly addressing in instruction.
+			if (right_node->is_constant())
+			{
+				// TODO: we should cache constant index from pre-pass.
+				float const constant_val = right_node->constant_val;
+				uint32_t const constant_idx = _writer.get_constant_index(constant_val);
+				constant_info& const_info = _writer.constants[constant_idx];
+				EXPR_JIT_ASSERT(const_info.uses > 0);
+
+				if (const_info.cur_reg != xmm_reg::num_reg)
+				{
+					// constant already in a register - make use of it.
+					right_op.set_as_xmm(const_info.cur_reg);
+					if (--const_info.uses == 0)
+					{
+						xmm_reg_to_free = const_info.cur_reg;
+						const_info.cur_reg = xmm_reg::num_reg;
+					}
+				}
+				else
+				{
+					if (--const_info.uses > 0)
+					{
+						// There is another use of this constant, so lets try and load it into a register.
+						right_op = _writer.reg_alloc.alloc_reg();
+						const_info.cur_reg = right_op.reg;
+						operand_location constant_loc;
+						constant_loc.set_as_constant(constant_idx);
+						if (!const_info.is_16b)
+						{
+							x64_movss(_writer, right_op, constant_loc);
+						}
+						else
+						{
+							// TODO
+							EXPR_JIT_ASSERT(false);
+						}
+					}
+					else
+					{
+						// address it directly.
+						right_op.set_as_constant(constant_idx);
+					}
+				}
+			}
+			else
+			{
+				// evaluate right node.
+				// TODO: Check variable.
+				right_op = _writer.reg_alloc.alloc_reg();
+				// TODO: Broken if spill.
+				xmm_reg_to_free = right_op.reg;
+				jit_expr_x64_build_from_ast(_writer, right_node, right_op);
+			}
+
+			jit_expr_x64_build_from_ast(_writer, left_node, _dest);
 
 			switch (_node->type)
 			{
@@ -1300,16 +1412,19 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 				case ast_node_type::bin_mul: x64_mulss(_writer, _dest, right_op); break;
 				case ast_node_type::bin_div: x64_divss(_writer, _dest, right_op); break;
 			}
-			_writer.reg_alloc.set_reg_unused(right_op.reg);
+
+			if (xmm_reg_to_free != xmm_reg::num_reg)
+			{
+				_writer.reg_alloc.set_reg_unused(xmm_reg_to_free);
+			}
 		} break;
 
 		case ast_node_type::un_neg:
 		{
 			jit_expr_x64_build_from_ast(_writer, _node->unary_op_child, _dest);
 
-			uint32_t constexpr sign_bit = 0x80000000;
 			operand_location const_loc;
-			const_loc.set_as_constant(_writer.get_constant_index_128(sign_bit));
+			const_loc.set_as_constant(_writer.get_constant_index_128(c_sign_bit));
 			x64_xorps(_writer, _dest, const_loc);
 		} break;
 
@@ -1322,7 +1437,6 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 
 		case ast_node_type::constant:
 		{
-			// TODO: Load constant to reg.
 			operand_location const_loc;
 			const_loc.set_as_constant(_writer.get_constant_index(_node->constant_val));
 			x64_movss(_writer, _dest, const_loc);
@@ -1335,6 +1449,23 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 	}
 }
 
+static void build_constant_usage_info(x64_writer_ctx& _writer, ast_node* _root)
+{
+	visit_ast_depth_first_post_order(_root, [&_writer](ast_node* _node)
+	{
+		if (_node->type == ast_node_type::constant)
+		{
+			uint32_t const idx = _writer.get_constant_index(_node->constant_val);
+			++_writer.constants[idx].uses;
+		}
+		else if (_node->type == ast_node_type::un_neg)
+		{
+			uint32_t const idx = _writer.get_constant_index_128(c_sign_bit);
+			++_writer.constants[idx].uses;
+		}
+	});
+}
+
 uint32_t jit_expr_x64(expr const* _expr, void* _buff, uint32_t _buff_size)
 {
 	EXPR_JIT_ASSERT(_expr);
@@ -1342,6 +1473,8 @@ uint32_t jit_expr_x64(expr const* _expr, void* _buff, uint32_t _buff_size)
 	
 	x64_writer_ctx asm_writer;
 	asm_writer.init(_expr, (uint8_t*)_buff, _buff_size);
+
+	build_constant_usage_info(asm_writer, _expr->root);
 
 	operand_location ret_loc;
 	ret_loc.set_as_xmm(xmm_reg::xmm0);
