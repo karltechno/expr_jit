@@ -9,6 +9,9 @@
 #if EXPR_JIT_COMPILER_MSVC
 extern "C" unsigned char _BitScanForward(unsigned long * _Index, unsigned long _Mask);
 #pragma intrinsic(_BitScanForward)
+
+extern "C" unsigned char _BitScanReverse(unsigned long * _Index, unsigned long _Mask);
+#pragma intrinsic(_BitScanReverse)
 #endif
 
 namespace expr_jit
@@ -69,6 +72,18 @@ static uint32_t find_first_set_lsb(uint32_t _v)
 #elif EXPR_JIT_COMPILER_MSVC
 	unsigned long idx;
 	return ::_BitScanForward(&idx, _v) ? idx : 32;
+#else
+#error Not implemented
+#endif
+}
+
+static uint32_t find_first_set_msb(uint32_t _v)
+{
+#if EXPR_JIT_COMPILER_CLANG || EXPR_JIT_COMPILER_GCC
+	return __builtin_clz(_v);
+#elif EXPR_JIT_COMPILER_MSVC
+	unsigned long idx;
+	return ::_BitScanReverse(&idx, _v) ? idx : 32;
 #else
 #error Not implemented
 #endif
@@ -1091,7 +1106,7 @@ static void x64_sse_binary_op(x64_writer_ctx& _writer, operand_location const& _
 	if (operand_requires_rex_prefix(_op1))
 	{
 		// REX.R
-		rex_byte |= 0b1000;
+		rex_byte |= 0b0100;
 	}
 
 	// Rex prefix if necessary.
