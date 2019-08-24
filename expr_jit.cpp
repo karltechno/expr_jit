@@ -6,6 +6,10 @@
 
 #include "expr_jit.h"
 
+#if EXPR_JIT_COMPILER_MSVC
+extern "C" unsigned char _BitScanForward(unsigned long * _Index, unsigned long _Mask);
+#pragma intrinsic(_BitScanForward)
+#endif
 
 namespace expr_jit
 {
@@ -56,6 +60,18 @@ static uint32_t fnv1a(char const* _str, uint32_t _len)
 		hash *= 16777619u;
 	}
 	return hash;
+}
+
+static uint32_t find_first_set_lsb(uint32_t _v)
+{
+#if EXPR_JIT_COMPILER_CLANG || EXPR_JIT_COMPILER_GCC
+	return __builtin_ctz(_v);
+#elif EXPR_JIT_COMPILER_MSVC
+	unsigned long idx;
+	return ::_BitScanForward(&idx, _v) ? idx : 32;
+#else
+#error Not implemented
+#endif
 }
 
 static void output_error(error_cb _err, char const* _fmt, ...)
@@ -911,31 +927,29 @@ struct operand_location
 
 struct register_allocator
 {
-	register_allocator()
-	{
-		for (bool& b : available_regs)
-		{
-			b = true;
-		}
-	}	 
-
 	operand_location alloc_reg()
 	{
-		for (uint32_t i = 0; i < xmm_reg::num_reg; ++i)
-		{
-			if (available_regs[i])
-			{
-				operand_location loc;
-				loc.set_as_xmm(xmm_reg(i));
-				return loc;
-			}
-		}
-
-		// TODO:
-		EXPR_JIT_ASSERT(false);
+		// TODO: Spill
+		EXPR_JIT_ASSERT(free_reg_mask);
+		operand_location loc;
+		loc.set_as_xmm(xmm_reg(find_first_set_lsb(free_reg_mask)));
+		set_reg_used(loc.reg);
+		return loc;
 	}
 
-	bool available_regs[xmm_reg::num_reg];
+	void set_reg_used(xmm_reg _reg)
+	{
+		EXPR_JIT_ASSERT((1 << _reg) & free_reg_mask);
+		free_reg_mask &= ~(1 << _reg);
+	}
+
+	void set_reg_unused(xmm_reg _reg)
+	{
+		EXPR_JIT_ASSERT(!((1 << _reg) & free_reg_mask));
+		free_reg_mask |= 1 << _reg;
+	}
+
+	uint32_t free_reg_mask = (1 << xmm_reg::num_reg) - 1;
 };
 
 enum builtin_constants
@@ -1028,6 +1042,8 @@ struct x64_writer_ctx
 	}
 
 	expr const* expr;
+
+	register_allocator reg_alloc;
 
 	dyn_pod_array<float> constants;
 	dyn_pod_array<constant_relocation> rip_disp32_relocs;
@@ -1182,13 +1198,13 @@ static void x64_movss(x64_writer_ctx& _writer, operand_location const& _dest, op
 static void x64_mulss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
 {
 	EXPR_JIT_ASSERT(_dest.is_register());
-	x64_sse_binary_op(_writer, _dest, _src, 0x59);
+	x64_sse_binary_op(_writer, _src, _dest, 0x59);
 }
 
 static void x64_divss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
 {
 	EXPR_JIT_ASSERT(_dest.is_register());
-	x64_sse_binary_op(_writer, _dest, _src, 0x5e);
+	x64_sse_binary_op(_writer, _src, _dest, 0x5e);
 }
 
 static void x64_addss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
@@ -1200,7 +1216,7 @@ static void x64_addss(x64_writer_ctx& _writer, operand_location const& _dest, op
 static void x64_subss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
 {
 	EXPR_JIT_ASSERT(_dest.is_register());
-	x64_sse_binary_op(_writer, _dest, _src, 0x5c);
+	x64_sse_binary_op(_writer, _src, _dest, 0x5c);
 }
 
 static void x64_ret(x64_writer_ctx& _writer)
@@ -1219,27 +1235,43 @@ void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node, opera
 		case ast_node_type::bin_mul:
 		case ast_node_type::bin_div:
 		{
+			operand_location const right_op = _writer.reg_alloc.alloc_reg();
+			jit_expr_x64_build_from_ast(_writer, _node->binary_op.left, _dest);
+			jit_expr_x64_build_from_ast(_writer, _node->binary_op.right, right_op);
 
-			//return eval_node(_node->binary_op.left, _args) + eval_node(_node->binary_op.right, _args);
+			switch (_node->type)
+			{
+				case ast_node_type::bin_sub: x64_subss(_writer, _dest, right_op); break;
+				case ast_node_type::bin_add: x64_addss(_writer, _dest, right_op); break;
+				case ast_node_type::bin_mul: x64_mulss(_writer, _dest, right_op); break;
+				case ast_node_type::bin_div: x64_divss(_writer, _dest, right_op); break;
+			}
+			_writer.reg_alloc.set_reg_unused(right_op.reg);
+
 		} break;
 
 		case ast_node_type::un_neg:
 		{
-			jit_expr_x64_build_from_ast(_writer, _node->unary_op_child->unary_op_child, _dest);
+			// TODO
+			EXPR_JIT_ASSERT(false);
+			//jit_expr_x64_build_from_ast(_writer, _node->unary_op_child->unary_op_child, _dest);
 			// Now negate the dest register 
 			// pxor reg, [c_sign_bit]
 		} break;
 
 		case ast_node_type::variable:
 		{
-			// TODO: Load to reg.
-			_node->variable_idx;
+			operand_location variable_loc;
+			variable_loc.set_as_arg(_node->variable_idx);
+			x64_movss(_writer, _dest, variable_loc);
 		} break;
 
 		case ast_node_type::constant:
 		{
 			// TODO: Load constant to reg.
-			uint32_t const const_idx = _writer.get_constant_index(_node->constant_val);
+			operand_location const_loc;
+			const_loc.set_as_constant(_writer.get_constant_index(_node->constant_val));
+			x64_movss(_writer, _dest, const_loc);
 		} break;
 
 		default:
@@ -1256,19 +1288,14 @@ uint32_t jit_expr_x64(expr const* _expr, uint8_t* _buff, size_t _buff_size)
 	
 	x64_writer_ctx asm_writer;
 	asm_writer.init(_expr, _buff, _buff_size);
-	operand_location ret_reg;
-	ret_reg.set_as_xmm(xmm_reg::xmm0);
-	
-	operand_location arg;
-	arg.set_as_arg(0);
 
-	operand_location const0;
-	const0.set_as_constant(asm_writer.get_constant_index(2.0f));
+	operand_location ret_loc;
+	ret_loc.set_as_xmm(xmm_reg::xmm0);
+	asm_writer.reg_alloc.set_reg_used(xmm_reg::xmm0);
 
-	x64_movss(asm_writer, ret_reg, const0);
-	x64_addss(asm_writer, ret_reg, arg);
+	jit_expr_x64_build_from_ast(asm_writer, _expr->root, ret_loc);
 	x64_ret(asm_writer);
-	
+
 	asm_writer.write_constants_and_relocate();
 
 	return asm_writer.bytes_written;

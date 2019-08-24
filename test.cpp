@@ -32,11 +32,6 @@ UTEST(constant_fold, fold1)
 
 	ASSERT_TRUE(expr_jit::expr_eval(expr, nullptr) == -16.0f);
 
-	void* code = alloc_writeable_executable_page();
-	expr_jit::jit_expr_x64(expr, (uint8_t*)code, 4096);
-	float args[] = { 2.5f };
-	float const val = expr_jit::expr_jit_eval(code, args);
-
 	expr_jit::free_expression(expr);
 }
 
@@ -104,9 +99,14 @@ UTEST(generic_expr, expr2)
 
 	float args[] = { 5.0f, 2.0f, 3.0f };
 
-	float const val = (((args[0] + 1.0f) * (args[1] / 2.0f)) * (args[2] + 1.0f));
+	void* code = alloc_writeable_executable_page();
+	expr_jit::jit_expr_x64(expr, (uint8_t*)code, 4096);
+	float const val_jit = expr_jit::expr_jit_eval(code, args);
 
-	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == val);
+	float const val_real = (((args[0] + 1.0f) * (args[1] / 2.0f)) * (args[2] + 1.0f));
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == val_real);
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == val_jit);
 	expr_jit::free_expression(expr);
 }
 
