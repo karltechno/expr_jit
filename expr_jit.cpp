@@ -380,6 +380,7 @@ struct ast_node
 	uint32_t get_fun_param_count() const { EXPR_JIT_ASSERT(type == ast_node_type::function); return c_builtin_function_num_param[uint32_t(function.index)]; }
 
 	ast_node_type type;
+	uint32_t node_id;
 
 	union
 	{
@@ -399,8 +400,51 @@ struct ast_node
 		} function;
 
 		ast_node* unary_op_child;
+
+		ast_node* free_list_next;
 	};
 };
+
+template <typename VisitFn>
+static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn const& _fn)
+{
+	switch (_node->type)
+	{
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_sub:
+		case ast_node_type::bin_mul:
+		case ast_node_type::bin_div:
+		{
+			ast_node* left_node = _node->binary_op.left;
+			ast_node* right_node = _node->binary_op.right;
+
+			visit_ast_depth_first_post_order(left_node, _fn);
+			visit_ast_depth_first_post_order(right_node, _fn);
+		} break;
+
+		case ast_node_type::un_neg:
+		{
+			visit_ast_depth_first_post_order(_node->unary_op_child, _fn);
+		} break;
+
+		case ast_node_type::function:
+		{
+			for (ast_node* param : _node->function.params)
+			{
+				if (param)
+				{
+					visit_ast_depth_first_post_order(param, _fn);
+				}
+			}
+		} break;
+
+		default:
+		{
+		} break;
+	}
+
+	_fn(_node);
+}
 
 struct ast_node_pool
 {
@@ -427,7 +471,7 @@ struct ast_node_pool
 
 	ast_node* alloc_node(alloc_hooks const& _hooks)
 	{
-		if (!chunk_list || chunk_list->next_node == c_nodes_per_chunk)
+		if (!free_list || !chunk_list || chunk_list->next_node == c_nodes_per_chunk)
 		{
 			chunk* c = (chunk*)_hooks.alloc(_hooks.ctx, sizeof(chunk));
 			memset(c->nodes, 0, sizeof(c->nodes));
@@ -436,10 +480,35 @@ struct ast_node_pool
 			chunk_list = c;
 			c->next_node = 0;
 		}
-		return &chunk_list->nodes[chunk_list->next_node++];
+
+		if (free_list)
+		{
+			ast_node* n = free_list;
+			free_list = n->free_list_next;
+			return n;
+		}
+		else
+		{
+			ast_node* n = &chunk_list->nodes[chunk_list->next_node++];
+			n->node_id = total_nodes++;
+			return n;
+		}
+	}
+
+	// Note: not necessary for leaks (whole pool is freed), only used to recycle nodes when performing transformations on AST.
+	void free_node(ast_node* _n)
+	{
+		visit_ast_depth_first_post_order(_n, [this](ast_node* _node) 
+		{
+			_node->free_list_next = free_list;
+			free_list = _node;
+		});
 	}
 
 	chunk* chunk_list;
+	ast_node* free_list;
+
+	uint32_t total_nodes;
 };
 
 struct expr
@@ -782,50 +851,11 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	return node;
 }
 
-template <typename VisitFn>
-static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn const& _fn)
+
+
+static void optimize_fold_constants(ast_node* _root, expr* _expr)
 {
-	switch (_node->type)
-	{
-		case ast_node_type::bin_add:
-		case ast_node_type::bin_sub:
-		case ast_node_type::bin_mul:
-		case ast_node_type::bin_div:
-		{
-			ast_node* left_node = _node->binary_op.left;
-			ast_node* right_node = _node->binary_op.right;
-
-			visit_ast_depth_first_post_order(left_node, _fn);
-			visit_ast_depth_first_post_order(right_node, _fn);
-		} break;
-
-		case ast_node_type::un_neg:
-		{
-			visit_ast_depth_first_post_order(_node->unary_op_child, _fn);
-		} break;
-
-		case ast_node_type::function:
-		{
-			for (ast_node* param : _node->function.params)
-			{
-				if (param)
-				{
-					visit_ast_depth_first_post_order(param, _fn);
-				}
-			}
-		} break;
-
-		default:
-		{
-		} break;
-	}
-
-	_fn(_node);
-}
-
-static void optimize_fold_constants(ast_node* _root)
-{
-	visit_ast_depth_first_post_order(_root, [](ast_node* _node)
+	visit_ast_depth_first_post_order(_root, [_expr](ast_node* _node)
 	{
 		switch (_node->type)
 		{
@@ -837,7 +867,11 @@ static void optimize_fold_constants(ast_node* _root)
 				if (_node->binary_op.left->type == ast_node_type::constant
 					&& _node->binary_op.right->type == ast_node_type::constant)
 				{
-					_node->constant_val = eval_node(_node, nullptr);
+					float const val = eval_node(_node, nullptr);
+					_expr->node_pool.free_node(_node->binary_op.left);
+					_expr->node_pool.free_node(_node->binary_op.right);
+					
+					_node->constant_val = val;
 					_node->type = ast_node_type::constant;
 				}
 
@@ -847,8 +881,11 @@ static void optimize_fold_constants(ast_node* _root)
 			{
 				if (_node->unary_op_child->type == ast_node_type::constant)
 				{
-					_node->constant_val = -_node->unary_op_child->constant_val;
+					float const val = -_node->unary_op_child->constant_val;
+					_expr->node_pool.free_node(_node->unary_op_child);
+
 					_node->type = ast_node_type::constant;
+					_node->constant_val = val;
 				}
 			} break;
 
@@ -864,6 +901,12 @@ static void optimize_fold_constants(ast_node* _root)
 				if (can_fold)
 				{
 					float const eval = eval_node(_node, nullptr);
+
+					for (uint32_t i = 0; i < param_count; ++i)
+					{
+						_expr->node_pool.free_node(_node->function.params[i]);
+					}
+
 					_node->type = ast_node_type::constant;
 					_node->constant_val = eval;
 				}
@@ -946,7 +989,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 		return nullptr;
 	}
 	
-	optimize_fold_constants(expression->root);
+	optimize_fold_constants(expression->root, expression);
 	optimize_strength_reduction(expression->root);
 
 	return expression;
