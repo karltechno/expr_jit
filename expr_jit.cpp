@@ -126,7 +126,7 @@ struct dyn_pod_array
 	}
 
 	dyn_pod_array(dyn_pod_array const&) = delete;
-	dyn_pod_array& operator&(dyn_pod_array const&) = delete;
+	dyn_pod_array& operator=(dyn_pod_array const&) = delete;
 
 	void init(alloc_hooks _hooks)
 	{
