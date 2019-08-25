@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <math.h>
 
 #include "expr_jit.h"
 
@@ -18,6 +19,7 @@ namespace expr_jit
 {
 
 uint32_t constexpr c_sign_bit = 0x80000000;
+uint32_t constexpr c_sign_mask = 0x7fffffff;
 
 
 static void* malloc_wrapper(void*, size_t _size)
@@ -192,11 +194,42 @@ struct dyn_pod_array
 	alloc_hooks hooks;
 };
 
+enum class builtin_function
+{
+	abs,
+	min,
+	max,
+	sqrt,
+	clamp,
+
+	num_functions
+};
+
+char const* c_builtin_function_name[uint32_t(builtin_function::num_functions)]
+{
+	"abs",
+	"min",
+	"max",
+	"sqrt",
+	"clamp"
+};
+
+static uint32_t const c_builtin_function_num_param[uint32_t(builtin_function::num_functions)] =
+{
+	1,
+	2,
+	2,
+	1,
+	3
+};
+
+
 enum class symbol_type
 {
 	invalid,
 	constant,
-	variable
+	variable,
+	function
 };
 
 struct symbol
@@ -209,6 +242,7 @@ struct symbol
 	{
 		float constant_val;
 		uint32_t variable_idx;
+		builtin_function function;
 	};
 };
 
@@ -256,6 +290,8 @@ struct symbol_table
 			{
 				return &symbols[idx];
 			}
+
+			idx = (idx + 1) & count_mask;
 		}
 	}
 
@@ -294,6 +330,20 @@ struct symbol_table
 			sym->constant_val = _expr_info->constant_values[i];
 		}
 
+		for (uint32_t i = 0; i < uint32_t(builtin_function::num_functions); ++i)
+		{
+			char const* sym_string = c_builtin_function_name[i];
+			symbol* sym = insert(sym_string);
+			if (sym->type != symbol_type::invalid)
+			{
+				output_error(_err_cb, "Function symbol name \"%s\" is already defined.", sym_string);
+				return false;
+			}
+
+			sym->type = symbol_type::function;
+			sym->function = builtin_function(i);
+		}
+
 		return true;
 	}
 
@@ -305,10 +355,14 @@ struct symbol_table
 	uint32_t count_mask = 0;
 };
 
+
+
+
 enum class ast_node_type
 {
 	constant,
 	variable,
+	function,
 
 	bin_add,
 	bin_sub,
@@ -323,6 +377,8 @@ struct ast_node
 	bool is_constant() const { return type == ast_node_type::constant; }
 	bool is_constant_or_var() const { return type == ast_node_type::constant || type == ast_node_type::variable; }
 
+	uint32_t get_fun_param_count() const { EXPR_JIT_ASSERT(type == ast_node_type::function); return c_builtin_function_num_param[uint32_t(function.index)]; }
+
 	ast_node_type type;
 
 	union
@@ -335,6 +391,12 @@ struct ast_node
 			ast_node* left;
 			ast_node* right;
 		} binary_op;
+
+		struct  
+		{
+			builtin_function index;
+			ast_node* params[3];
+		} function;
 
 		ast_node* unary_op_child;
 	};
@@ -368,6 +430,8 @@ struct ast_node_pool
 		if (!chunk_list || chunk_list->next_node == c_nodes_per_chunk)
 		{
 			chunk* c = (chunk*)_hooks.alloc(_hooks.ctx, sizeof(chunk));
+			memset(c->nodes, 0, sizeof(c->nodes));
+
 			c->next_chunk = chunk_list;
 			chunk_list = c;
 			c->next_node = 0;
@@ -413,9 +477,11 @@ enum class token_type
 {
 	left_paren,
 	right_paren,
+	comma,
 
-	variable,
 	constant,
+
+	symbol,
 
 	plus,
 	minus,
@@ -432,7 +498,6 @@ struct token
 	union
 	{
 		float constant_val;
-		uint32_t variable_idx;
 		symbol* sym;
 	};
 };
@@ -482,6 +547,7 @@ static bool lex_next(lexer_ctx& _ctx)
 			case '*': _ctx.peek.type = token_type::multiply; ++_ctx.cur; return true;
 			case '-': _ctx.peek.type = token_type::minus; ++_ctx.cur; return true;
 			case '/': _ctx.peek.type = token_type::divide; ++_ctx.cur; return true;
+			case ',': _ctx.peek.type = token_type::comma; ++_ctx.cur; return true;
 
 			case '0':
 			case '1':
@@ -516,7 +582,7 @@ static bool lex_next(lexer_ctx& _ctx)
 					char next_c = to_lower(*_ctx.cur);
 					while (next_c >= 'a' && next_c <= 'z')
 					{
-						next_c = *_ctx.cur++;
+						next_c = *(++_ctx.cur);
 					}
 
 					symbol* sym = _ctx.sym_table->find(str_begin, uint32_t(_ctx.cur - str_begin));
@@ -526,27 +592,9 @@ static bool lex_next(lexer_ctx& _ctx)
 						output_error(_ctx.error_cb, "Found undeclared symbol: \"%.*s\".", uint32_t(_ctx.cur - str_begin), str_begin);
 						return false;
 					}
-					
-					switch (sym->type)
-					{
-						case symbol_type::constant:
-						{
-							_ctx.peek.type = token_type::constant;
-							_ctx.peek.constant_val = sym->constant_val;
-						} break;
 
-						case symbol_type::variable:
-						{
-							_ctx.peek.type = token_type::variable;
-							_ctx.peek.variable_idx = sym->variable_idx;
-						} break;
-
-						default:
-						{
-							EXPR_JIT_ASSERT(false);
-							return false;
-						};
-					}
+					_ctx.peek.type = token_type::symbol;
+					_ctx.peek.sym = sym;
 
 					return true;
 				}
@@ -572,10 +620,11 @@ static bool lex_expect(lexer_ctx& _lexer, token_type _type)
 static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer);
 static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer);
 static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer);
+static float eval_node(ast_node const* _node, float const* _args);
 
 static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 {
-	// factor -> [-] constant | variable | (expr)
+	// factor -> [-] constant | variable | function | (expr)
 	ast_node* neg_node = nullptr;
 	ast_node* factor_node = nullptr;
 
@@ -588,12 +637,67 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 
 	switch (_lexer.peek.type)
 	{
-		case token_type::variable:
+		case token_type::symbol:
 		{
+			token const tok = _lexer.peek;
 			lex_next(_lexer);
-			factor_node = _parser.expression->alloc_ast_node();
-			factor_node->type = ast_node_type::variable;
-			factor_node->variable_idx = _lexer.peek.variable_idx;
+
+			switch (tok.sym->type)
+			{
+				case symbol_type::constant:
+				{
+					factor_node = _parser.expression->alloc_ast_node();
+					factor_node->type = ast_node_type::constant;
+					factor_node->constant_val = tok.sym->constant_val;
+				} break;
+
+				case symbol_type::variable:
+				{
+					factor_node = _parser.expression->alloc_ast_node();
+					factor_node->type = ast_node_type::variable;
+					factor_node->variable_idx = tok.sym->variable_idx;
+				} break;
+
+				case symbol_type::function:
+				{
+					factor_node = _parser.expression->alloc_ast_node();
+					factor_node->type = ast_node_type::function;
+					factor_node->function.index = tok.sym->function;
+					uint32_t const fn_params = c_builtin_function_num_param[uint32_t(tok.sym->function)];
+					
+					if (!lex_expect(_lexer, token_type::left_paren))
+					{
+						output_error(_lexer.error_cb, "Expected '(' after function \"%s\"", c_builtin_function_name[uint32_t(tok.sym->function)]);
+						return nullptr;
+					}
+
+					for (uint32_t i = 0; i < fn_params; ++i)
+					{
+						factor_node->function.params[i] = parse_expr_ast(_parser, _lexer);
+						if (!factor_node->function.params[i])
+						{
+							return nullptr;
+						}
+
+						if (i != fn_params - 1)
+						{
+							if (!lex_expect(_lexer, token_type::comma))
+							{
+								output_error(_lexer.error_cb, "Expected ',' after param %u for function \"%s\"", i, c_builtin_function_name[uint32_t(tok.sym->function)]);
+								return nullptr;
+							}
+						}
+					}
+
+					if (!lex_expect(_lexer, token_type::right_paren))
+					{
+						output_error(_lexer.error_cb, "Expected ')' after function \"%s\"", c_builtin_function_name[uint32_t(tok.sym->function)]);
+						return nullptr;
+					}
+
+				} break;
+			}
+
 		} break;
 
 		case token_type::constant:
@@ -612,7 +716,6 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 			{
 				return nullptr;
 			}
-
 		} break;
 	}
 
@@ -701,6 +804,17 @@ static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn const& _fn
 			visit_ast_depth_first_post_order(_node->unary_op_child, _fn);
 		} break;
 
+		case ast_node_type::function:
+		{
+			for (ast_node* param : _node->function.params)
+			{
+				if (param)
+				{
+					visit_ast_depth_first_post_order(param, _fn);
+				}
+			}
+		} break;
+
 		default:
 		{
 		} break;
@@ -723,14 +837,7 @@ static void optimize_fold_constants(ast_node* _root)
 				if (_node->binary_op.left->type == ast_node_type::constant
 					&& _node->binary_op.right->type == ast_node_type::constant)
 				{
-					switch (_node->type)
-					{
-						case ast_node_type::bin_add: _node->constant_val = _node->binary_op.left->constant_val + _node->binary_op.right->constant_val; break;
-						case ast_node_type::bin_sub: _node->constant_val = _node->binary_op.left->constant_val - _node->binary_op.right->constant_val; break;
-						case ast_node_type::bin_mul: _node->constant_val = _node->binary_op.left->constant_val * _node->binary_op.right->constant_val; break;
-						case ast_node_type::bin_div: _node->constant_val = _node->binary_op.left->constant_val / _node->binary_op.right->constant_val; break;
-					}
-
+					_node->constant_val = eval_node(_node, nullptr);
 					_node->type = ast_node_type::constant;
 				}
 
@@ -743,6 +850,24 @@ static void optimize_fold_constants(ast_node* _root)
 					_node->constant_val = -_node->unary_op_child->constant_val;
 					_node->type = ast_node_type::constant;
 				}
+			} break;
+
+			case ast_node_type::function:
+			{
+				uint32_t const param_count = _node->get_fun_param_count();
+				bool can_fold = true;
+				for (uint32_t i = 0; i < param_count; ++i)
+				{
+					can_fold &= _node->function.params[i]->is_constant();
+				}
+
+				if (can_fold)
+				{
+					float const eval = eval_node(_node, nullptr);
+					_node->type = ast_node_type::constant;
+					_node->constant_val = eval;
+				}
+
 			} break;
 
 			default:
@@ -801,7 +926,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 	parser_ctx parser;
 	parser.init(expression, &_info, err_cb);
 
-	uint32_t const sym_entries = next_pow2(_info.num_constants + _info.num_variables + 1);
+	uint32_t const sym_entries = next_pow2(_info.num_constants + _info.num_variables + uint32_t(builtin_function::num_functions) + 1);
 
 	uint32_t* sym_hashes = (uint32_t*)alloca(sizeof(uint32_t) * sym_entries);
 	symbol* symbols = (symbol*)alloca(sizeof(symbol) * sym_entries);
@@ -838,7 +963,7 @@ void free_expression(expr* _expr)
 	_expr->alloc.free(_expr->alloc.ctx, _expr);
 }
 
-float eval_node(ast_node const* _node, float const* _args)
+static float eval_node(ast_node const* _node, float const* _args)
 {
 	switch (_node->type)
 	{
@@ -875,6 +1000,38 @@ float eval_node(ast_node const* _node, float const* _args)
 		case ast_node_type::constant:
 		{
 			return _node->constant_val;
+		} break;
+
+		case ast_node_type::function:
+		{
+			switch (_node->function.index)
+			{
+				case builtin_function::abs: return fabsf(eval_node(_node->function.params[0], _args));
+				case builtin_function::min:
+				{
+					float const f0 = eval_node(_node->function.params[0], _args);
+					float const f1 = eval_node(_node->function.params[1], _args);
+					return f0 < f1 ? f0 : f1;
+				} break;
+
+				case builtin_function::max:
+				{
+					float const f0 = eval_node(_node->function.params[0], _args);
+					float const f1 = eval_node(_node->function.params[1], _args);
+					return f0 > f1 ? f0 : f1;
+				} break;
+
+				case builtin_function::sqrt: return sqrtf(eval_node(_node->function.params[0], _args));
+
+				case builtin_function::clamp:
+				{
+					float const x = eval_node(_node->function.params[0], _args);
+					float const min = eval_node(_node->function.params[1], _args);
+					float const max = eval_node(_node->function.params[2], _args);
+					float const a = (x > max ? max : x);
+					return a < min ? min : a;
+				} break;
+			}
 		} break;
 
 		default:
@@ -1331,6 +1488,30 @@ static void x64_subss(x64_writer_ctx& _writer, operand_location const& _dest, op
 	x64_sse_binary_op(_writer, _src, _dest, 0x5c);
 }
 
+static void x64_minss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x5d);
+}
+
+static void x64_maxss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x5f);
+}
+
+static void x64_sqrtss(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x51);
+}
+
+static void x64_and_ps(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_sse_binary_op(_writer, _src, _dest, 0x54, true);
+}
+
 static void x64_xorps(x64_writer_ctx& _writer, operand_location const& _dest, operand_location const& _src)
 {
 	EXPR_JIT_ASSERT(_dest.is_register());
@@ -1439,15 +1620,6 @@ static void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node
 			ast_node* left_node = _node->binary_op.left;
 			ast_node* right_node = _node->binary_op.right;
 
-			if (left_node->is_constant_or_var() && _node->type != ast_node_type::bin_div)
-			{
-				// If constant is on left hand side and the binary operator is commutative then switch them round.
-				// Eg if expression would be like so: mulss [constant], [expr]
-				// Then swap it so we have mulss [expr], [constant] so we can directly evaluate [expr] in dest register and address constant in same instruction.
-				swap(left_node, right_node);
-			}
-
-			// Look for optimizations for putting constant in re-usable register or directly addressing in instruction.
 			if (right_node->is_constant_or_var())
 			{
 				right_op = load_constant_or_var(_writer, right_node, &xmm_reg_to_free);
@@ -1501,6 +1673,66 @@ static void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node
 			x64_movss(_writer, _dest, const_loc);
 		} break;
 
+		case ast_node_type::function:
+		{
+			switch (_node->function.index)
+			{
+				case builtin_function::abs:
+				{
+					// TODO: Redundant loads.
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
+					operand_location const_loc;
+					const_loc.set_as_constant(_writer.get_constant_index_128(c_sign_mask));
+					// use andnot to potentially reuse sign bit in a register (need to implement that).
+					x64_and_ps(_writer, _dest, const_loc);
+				} break;
+
+				case builtin_function::min:
+				{
+					// TODO: Redundant loads.
+					operand_location src_loc = _writer.reg_alloc.alloc_reg();
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[1], src_loc);
+					x64_minss(_writer, _dest, src_loc);
+					_writer.reg_alloc.set_reg_unused(src_loc.reg);
+				} break;
+
+				case builtin_function::max:
+				{
+					// TODO: Redundant loads.
+					operand_location src_loc = _writer.reg_alloc.alloc_reg();
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[1], src_loc);
+					x64_maxss(_writer, _dest, src_loc);
+					_writer.reg_alloc.set_reg_unused(src_loc.reg);
+				} break;
+
+				case builtin_function::sqrt: 
+				{
+					// TODO: Redundant loads.
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
+					x64_sqrtss(_writer, _dest, _dest);
+				} break;
+
+				case builtin_function::clamp:
+				{
+					// TODO: Redundant loads.
+					operand_location params[2];
+					params[0] = _writer.reg_alloc.alloc_reg();
+					params[1] = _writer.reg_alloc.alloc_reg();
+
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[1], params[0]);
+					jit_expr_x64_build_from_ast(_writer, _node->function.params[2], params[1]);
+
+					x64_minss(_writer, _dest, params[1]);
+					x64_maxss(_writer, _dest, params[0]);
+					_writer.reg_alloc.set_reg_unused(params[0].reg);
+					_writer.reg_alloc.set_reg_unused(params[1].reg);
+				} break;
+			}
+		} break;
+
 		default:
 		{
 			EXPR_JIT_ASSERT(false);
@@ -1537,7 +1769,6 @@ uint32_t jit_expr_x64(expr const* _expr, void* _buff, uint32_t _buff_size)
 	
 	x64_writer_ctx asm_writer;
 	asm_writer.init(_expr, (uint8_t*)_buff, _buff_size);
-
 	build_constant_usage_info(asm_writer, _expr->root);
 
 	operand_location ret_loc;
