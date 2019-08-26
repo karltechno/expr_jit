@@ -90,6 +90,108 @@ UTEST(constant_fold, fold3)
 	expr_jit::free_expression(expr);
 }
 
+UTEST(identities, identity0)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "0 - x";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+
+	float args[] = { 1.5f };
+
+	float const expected = -1.5f;
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == expected);
+	ASSERT_TRUE(jit_val == expected);
+	expr_jit::free_expression(expr);
+}
+
+UTEST(identities, identity1)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "x / 1";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+
+	float args[] = { 1.5f };
+
+	float const expected = 1.5f;
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == expected);
+	ASSERT_TRUE(jit_val == expected);
+	expr_jit::free_expression(expr);
+}
+
+UTEST(identities, identity2)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "x * 1";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+
+	float args[] = { 1.5f };
+
+	float const expected = 1.5f;
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == expected);
+	ASSERT_TRUE(jit_val == expected);
+	expr_jit::free_expression(expr);
+}
+
+UTEST(identities, identity3)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "0 * x";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+
+	float args[] = { 1.0f };
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_TRUE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == 0.0f);
+	ASSERT_TRUE(jit_val == 0.0f);
+	expr_jit::free_expression(expr);
+}
+
 UTEST(generic_expr, expr1)
 {
 	expr_jit::expression_info info = {};

@@ -573,6 +573,46 @@ struct ast_node
 	};
 };
 
+// Copy contents but leave parent and node_id intact.
+void copy_ast_node_contents(ast_node* _dest, ast_node const* _src)
+{
+	switch (_src->type)
+	{
+		case ast_node_type::function:	
+		{
+			memcpy(&_dest->function, &_src->function, sizeof(_src->function)); 
+		} break;
+
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_sub:
+		case ast_node_type::bin_mul:
+		case ast_node_type::bin_div:
+		{
+			memcpy(&_dest->binary_op, &_src->binary_op, sizeof(_src->binary_op)); break;
+		} break;
+
+		case ast_node_type::un_neg:
+		{
+			memcpy(&_dest->unary_op_child, &_src->unary_op_child, sizeof(_src->unary_op_child)); break;
+
+		} break;
+
+		case ast_node_type::constant:
+		{
+			memcpy(&_dest->constant_val, &_src->constant_val, sizeof(_src->constant_val)); break;
+		} break;
+
+		case ast_node_type::variable:
+		{
+			memcpy(&_dest->variable_idx, &_src->variable_idx, sizeof(_src->variable_idx)); break;
+		} break;
+
+		case ast_node_type::invalid: break;
+	}
+
+	_dest->type = _src->type;
+}
+
 template <typename VisitFn>
 static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn _fn)
 {
@@ -1031,7 +1071,22 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	return node;
 }
 
+static bool fold_binary_op_generic(expr* _expr, ast_node* _node)
+{
+	if (_node->binary_op.left->type == ast_node_type::constant
+		&& _node->binary_op.right->type == ast_node_type::constant)
+	{
+		float const val = eval_node(_node, nullptr);
+		_expr->node_pool.free_node(_node->binary_op.left);
+		_expr->node_pool.free_node(_node->binary_op.right);
 
+		_node->constant_val = val;
+		_node->type = ast_node_type::constant;
+		return true;
+	}
+	
+	return false;
+}
 
 static void optimize_fold_constants(ast_node* _root, expr* _expr)
 {
@@ -1040,21 +1095,91 @@ static void optimize_fold_constants(ast_node* _root, expr* _expr)
 		switch (_node->type)
 		{
 			case ast_node_type::bin_add:
+			{
+				if (!fold_binary_op_generic(_expr, _node))
+				{
+					ast_node* const_op = nullptr;
+					if (_node->binary_op.left->is_constant()) const_op = _node->binary_op.left;
+					else if (_node->binary_op.right->is_constant()) const_op = _node->binary_op.right;
+
+					if (const_op && const_op->constant_val == 0.0f)
+					{
+						// x + 0 = x
+						ast_node* other = const_op == _node->binary_op.left ? _node->binary_op.right : _node->binary_op.left;
+						copy_ast_node_contents(_node, other);
+						_expr->node_pool.free_node(_node->binary_op.left);
+						_expr->node_pool.free_node(_node->binary_op.right);
+					}
+				}
+			} break;
+
 			case ast_node_type::bin_sub:
+			{
+				if (!fold_binary_op_generic(_expr, _node))
+				{
+					// 0 - x = -x
+					if (_node->binary_op.left->is_constant()
+						&& _node->binary_op.left->constant_val == 0.0f)
+					{
+						ast_node* right = _node->binary_op.right;
+						_expr->node_pool.free_node(_node->binary_op.left);
+						_node->type = ast_node_type::un_neg;
+						_node->unary_op_child = right;
+					}
+				}
+			} break;
+
 			case ast_node_type::bin_mul:
+			{
+				if (!fold_binary_op_generic(_expr, _node))
+				{
+					ast_node* const_op = nullptr;
+					if (_node->binary_op.left->is_constant()) const_op = _node->binary_op.left;
+					else if (_node->binary_op.right->is_constant()) const_op = _node->binary_op.right;
+
+					if (const_op)
+					{
+						if (const_op->constant_val == 0.0f)
+						{
+							// x * 0 = 0
+							_expr->node_pool.free_node(_node->binary_op.left);
+							_expr->node_pool.free_node(_node->binary_op.right);
+							_node->type = ast_node_type::constant;
+							_node->constant_val = 0.0f;
+						}
+						else if (const_op->constant_val == 1.0f)
+						{
+							// x * 1 = x
+							ast_node* other = const_op == _node->binary_op.left ? _node->binary_op.right : _node->binary_op.left;
+							copy_ast_node_contents(_node, other);
+							_expr->node_pool.free_node(const_op);
+							_expr->node_pool.free_node(other);
+						}
+					}
+
+
+				}
+			} break;
+
 			case ast_node_type::bin_div:
 			{
-				if (_node->binary_op.left->type == ast_node_type::constant
-					&& _node->binary_op.right->type == ast_node_type::constant)
+				if (!fold_binary_op_generic(_expr, _node))
 				{
-					float const val = eval_node(_node, nullptr);
-					_expr->node_pool.free_node(_node->binary_op.left);
-					_expr->node_pool.free_node(_node->binary_op.right);
-					
-					_node->constant_val = val;
-					_node->type = ast_node_type::constant;
-				}
+					ast_node* right = _node->binary_op.right;
+					if(!right->is_constant())
+					{
+						return;
+					}
 
+					// x / 1 = x
+					if (right->constant_val == 1.0f)
+					{
+						ast_node* left = _node->binary_op.left;
+						copy_ast_node_contents(_node, left);
+						_expr->node_pool.free_node(left);
+						_expr->node_pool.free_node(right);
+					}
+				}
 			} break;
 
 			case ast_node_type::un_neg:
@@ -1122,8 +1247,8 @@ static void optimize_strength_reduction(ast_node* _root)
 			} break;
 		}
 	});
-
 }
+
 
 struct ast_balancing_queue
 {
@@ -1947,6 +2072,12 @@ static void x64_xorps(x64_writer_ctx& _writer, operand_location const& _dest, op
 {
 	EXPR_JIT_ASSERT(_dest.is_register());
 	x64_sse_binary_op(_writer, _src, _dest, 0x57, true);
+}
+
+static void x64_zero_reg(x64_writer_ctx& _writer, operand_location const& _dest)
+{
+	EXPR_JIT_ASSERT(_dest.is_register());
+	x64_xorps(_writer, _dest, _dest);
 }
 
 static void x64_ret(x64_writer_ctx& _writer)
