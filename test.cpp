@@ -6,10 +6,14 @@
 #include "expr_jit.h"
 #include "utest.h"
 
+
 UTEST_STATE();
 
 void* g_code_ptr = nullptr;
 uint32_t constexpr c_code_ptr_size = 4096 * 4;
+
+char const* c_constant_names[] = { "pi", "two_pi", "e", "ln2", "ln10" };
+float const c_constants[] = { 3.14159265358979323846f, 6.2831853071795862f, 2.71828182845904523536f, 0.693147180559945309417f, 2.30258509299404568402f };
 
 static bool float_rel_equal(float _lhs, float _rhs, float _minAbs, float _relTol)
 {
@@ -191,6 +195,64 @@ UTEST(identities, identity3)
 	ASSERT_TRUE(jit_val == 0.0f);
 	expr_jit::free_expression(expr);
 }
+
+UTEST(constants, constants0)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "pi * x";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+	info.constant_names = c_constant_names;
+	info.constant_values = c_constants;
+	info.num_constants = sizeof(c_constant_names) / sizeof(*c_constant_names);
+
+	float args[] = { 2.0f };
+	float const expected = c_constants[0] * 2.0f;
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == expected);
+	ASSERT_TRUE(jit_val == expected);
+	expr_jit::free_expression(expr);
+}
+
+
+UTEST(constants, constants1)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "pi * e / x";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+	info.constant_names = c_constant_names;
+	info.constant_values = c_constants;
+	info.num_constants = sizeof(c_constant_names) / sizeof(*c_constant_names);
+
+	float args[] = { 2.0f };
+	float const expected = c_constants[0] * c_constants[2] / args[0];
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == expected);
+	ASSERT_TRUE(jit_val == expected);
+	expr_jit::free_expression(expr);
+}
+
 
 UTEST(generic_expr, expr1)
 {
