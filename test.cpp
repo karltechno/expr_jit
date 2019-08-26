@@ -115,6 +115,8 @@ UTEST(generic_expr, expr1)
 	expr_jit::free_expression(expr);
 }
 
+
+
 UTEST(generic_expr, expr2)
 {
 	expr_jit::expression_info info = {};
@@ -166,6 +168,34 @@ UTEST(generic_expr, expr3)
 	ASSERT_TRUE(val_real == jit_val);
 	expr_jit::free_expression(expr);
 }
+
+UTEST(generic_expr, expr4)
+{
+	expr_jit::expression_info info = {};
+	info.expr = "x + 1 + 2 + 3 + 4 + 6 + 7 + 8 + 9 + 10 + (y * 3 * 4 * 5 * 6 * 1)";
+	info.expr_len = uint32_t(strlen(info.expr));
+
+	char const* arg_names[] = { "x", "y" };
+	info.variables = arg_names;
+	info.num_variables = sizeof(arg_names) / sizeof(*arg_names);
+
+	expr_jit::expr* expr = expr_jit::parse_expression(info, [](char const* _err) { printf(_err); });
+	ASSERT_TRUE(expr);
+	ASSERT_FALSE(expr_jit::is_expr_constant(expr));
+
+	float args[] = { 5.0f, 1.5f };
+
+	float const real_val = args[0] + 1.0f + 2.0f + 3.0f + 4.0f + 6.0f + 7.0f + 8.0f + 9.0f + 10.0f + (args[1] * 3.0f * 4.0f * 5.0f * 6.0f);
+
+	float jit_val;
+	JIT_AND_RUN(expr, args, jit_val);
+
+	ASSERT_TRUE(expr_jit::expr_eval(expr, args) == real_val);
+	ASSERT_TRUE(jit_val == real_val);
+
+	expr_jit::free_expression(expr);
+}
+
 
 UTEST(functions, sqrt)
 {

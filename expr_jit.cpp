@@ -112,6 +112,95 @@ void swap(T& _lhs, T& _rhs)
 	_rhs = temp;
 }
 
+// Push element at index _arr_size - 1 onto heap.
+template<typename T, typename PredT>
+void heap_push(T* _ptr, uint32_t _arr_size, PredT _pred)
+{
+	EXPR_JIT_ASSERT(_arr_size);
+	uint32_t idx = _arr_size - 1;
+	uint32_t parent = idx / 2;
+
+	while (idx != 0 && _pred(_ptr[idx], _ptr[parent]))
+	{
+		swap(_ptr[idx], _ptr[parent]);
+		idx = parent;
+		parent = idx / 2;
+	}
+}
+
+// Pop element at index 0 off the heap.
+template<typename T, typename PredT>
+void heap_pop(T* _ptr, uint32_t _arr_size, PredT _pred)
+{
+	EXPR_JIT_ASSERT(_arr_size);
+
+	swap(_ptr[0], _ptr[_arr_size - 1]);
+	uint32_t const new_size = _arr_size - 1;
+
+	if (new_size < 2)
+	{
+		return;
+	}
+
+	uint32_t idx = 0;
+	uint32_t left = idx * 2 + 1;
+	
+	while (left < new_size)
+	{
+		uint32_t right = left + 1;
+
+		uint32_t child_to_consider = left;
+
+		if (right < new_size && _pred(_ptr[right], _ptr[left]))
+		{
+			child_to_consider = right;
+		}
+
+		if (_pred(_ptr[child_to_consider], _ptr[idx]))
+		{
+			swap(_ptr[child_to_consider], _ptr[idx]);
+			idx = child_to_consider;
+			left = idx * 2 + 1;
+		}
+		else
+		{
+			break;
+		}
+	}
+}
+
+template <typename T>
+struct stack
+{
+	void init(T* _mem, uint32_t _cap)
+	{
+		mem = _mem;
+		size = 0;
+		cap = _cap;
+	}
+
+	void push(T const& _t)
+	{
+		EXPR_JIT_ASSERT(size < cap);
+		mem[size++] = _t;
+	}
+
+	bool pop(T* o_val)
+	{
+		if (!size)
+		{
+			return false;
+		}
+
+		*o_val = mem[--size];
+		return true;
+	}
+
+	T* mem;
+	uint32_t cap = 0;
+	uint32_t size = 0;
+};
+
 template <typename T>
 struct dyn_pod_array
 {
@@ -226,7 +315,7 @@ static uint32_t const c_builtin_function_num_param[uint32_t(builtin_function::nu
 
 enum class symbol_type
 {
-	invalid,
+	invalid = 0,
 	constant,
 	variable,
 	function
@@ -297,6 +386,7 @@ struct symbol_table
 
 	bool init(symbol* _symbol_mem, uint32_t* _hash_mem, uint32_t _max_entries, expression_info const* _expr_info, error_cb _err_cb)
 	{
+		EXPR_JIT_ASSERT((_max_entries & (_max_entries - 1)) == 0 && "_max_entries must be a power of two for hash table.");
 		symbols = _symbol_mem;
 		hashes = _hash_mem;
 		count_mask = _max_entries - 1;
@@ -360,6 +450,8 @@ struct symbol_table
 
 enum class ast_node_type
 {
+	invalid,
+
 	constant,
 	variable,
 	function,
@@ -372,13 +464,89 @@ enum class ast_node_type
 	un_neg
 };
 
+static bool is_bin_op_associative(ast_node_type _type)
+{
+	switch (_type)
+	{
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_mul:
+		{
+			return true;
+		}
+
+		default:
+		{
+			return false;
+		}
+	}
+}
+
+static bool is_bin_op_commutative(ast_node_type _type)
+{
+	switch (_type)
+	{
+		case ast_node_type::bin_add:
+		case ast_node_type::bin_mul:
+		{
+			return true;
+		}
+
+		default:
+		{
+			return false;
+		}
+	}
+}
+
 struct ast_node
 {
 	bool is_constant() const { return type == ast_node_type::constant; }
 	bool is_constant_or_var() const { return type == ast_node_type::constant || type == ast_node_type::variable; }
 
+	bool is_binary_op() const
+	{
+		switch (type)
+		{
+			case ast_node_type::bin_add:
+			case ast_node_type::bin_sub:
+			case ast_node_type::bin_mul:
+			case ast_node_type::bin_div:
+			{
+				return true;
+			}
+
+			default:
+			{
+				return false;
+			}
+		}
+	}
+
+	uint32_t op_precedence() const
+	{
+		switch (type)
+		{
+			case ast_node_type::function:	return 0;
+			case ast_node_type::bin_add:	return 3;
+			case ast_node_type::bin_sub:	return 3;
+			case ast_node_type::bin_mul:	return 2;
+			case ast_node_type::bin_div:	return 2;
+			case ast_node_type::un_neg:		return 1;
+
+			case ast_node_type::invalid:
+			case ast_node_type::constant:
+			case ast_node_type::variable:
+			{
+				EXPR_JIT_ASSERT(false); return 0;
+			} break;
+		}
+
+		EXPR_JIT_UNREACHABLE;
+	}
+
 	uint32_t get_fun_param_count() const { EXPR_JIT_ASSERT(type == ast_node_type::function); return c_builtin_function_num_param[uint32_t(function.index)]; }
 
+	ast_node* parent;
 	ast_node_type type;
 	uint32_t node_id;
 
@@ -406,7 +574,7 @@ struct ast_node
 };
 
 template <typename VisitFn>
-static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn const& _fn)
+static void visit_ast_depth_first_post_order(ast_node* _node, VisitFn _fn)
 {
 	switch (_node->type)
 	{
@@ -748,6 +916,8 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 							return nullptr;
 						}
 
+						factor_node->function.params[i]->parent = factor_node;
+
 						if (i != fn_params - 1)
 						{
 							if (!lex_expect(_lexer, token_type::comma))
@@ -791,6 +961,7 @@ static ast_node* parse_factor_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 	if (factor_node && neg_node)
 	{
 		neg_node->unary_op_child = factor_node;
+		factor_node->parent = neg_node;
 		return neg_node;
 	}
 
@@ -814,13 +985,18 @@ static ast_node* parse_term_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 		lex_next(_lexer);
 		ast_node* bin_op = _parser.expression->alloc_ast_node();
 		bin_op->type = tok.type == token_type::divide ? ast_node_type::bin_div : ast_node_type::bin_mul;
+
 		bin_op->binary_op.left = node;
 		bin_op->binary_op.right = parse_factor_ast(_parser, _lexer);
-		
+	
 		if (!bin_op->binary_op.right)
 		{
 			return nullptr;
 		}
+
+		bin_op->binary_op.left->parent = bin_op;
+		bin_op->binary_op.right->parent = bin_op;
+
 		node = bin_op;
 	}
 	return node;
@@ -845,6 +1021,10 @@ static ast_node* parse_expr_ast(parser_ctx& _parser, lexer_ctx& _lexer)
 		{
 			return nullptr;
 		}
+
+		bin_op->binary_op.left->parent = bin_op;
+		bin_op->binary_op.right->parent = bin_op;
+
 		node = bin_op;
 	}
 
@@ -945,6 +1125,213 @@ static void optimize_strength_reduction(ast_node* _root)
 
 }
 
+struct ast_balancing_queue
+{
+	struct entry
+	{
+		ast_node* node;
+		int16_t rank;
+	};
+
+	void init(entry* _arr, uint32_t _max_entries)
+	{
+		entries = _arr;
+		max_entries = _max_entries;
+	}
+
+	static bool entry_cmp(entry const& _lhs, entry const& _rhs)
+	{
+		return _lhs.rank < _rhs.rank;
+	}
+
+	void push(ast_node* _n, int16_t _rank)
+	{
+		EXPR_JIT_ASSERT(cur_entries < max_entries);
+		entry* e = &entries[cur_entries++];
+		e->node = _n;
+		e->rank = _rank;
+		heap_push(entries, cur_entries, entry_cmp);
+	}
+
+	ast_node* pop()
+	{
+		if (!cur_entries)
+		{
+			return nullptr;
+		}
+
+		ast_node* ret = entries[0].node;
+		heap_pop(entries, cur_entries--, entry_cmp);
+		return ret;
+	}
+
+	entry* entries = nullptr;
+
+	uint32_t max_entries = 0;
+	uint32_t cur_entries = 0;
+};
+
+struct balancing_node_info
+{
+	int16_t weight;
+	bool is_root;
+};
+
+static void do_balance_tree(expr* _expr, balancing_node_info* _node_info, ast_node* _root)
+{
+	EXPR_JIT_ASSERT(_root->is_binary_op());
+	EXPR_JIT_ASSERT(_root->node_id < _expr->node_pool.total_nodes);
+	// Already processed.
+	if (_node_info[_root->node_id].weight >= 0)
+	{
+		return;
+	}
+
+	ast_balancing_queue leaf_binary_heap;
+	stack<ast_node*> nodes_to_process;
+	nodes_to_process.init((ast_node**)alloca(sizeof(ast_node*) * _expr->node_pool.total_nodes), _expr->node_pool.total_nodes);
+
+	{
+		uint32_t const total_nodes = _expr->node_pool.total_nodes;
+		ast_balancing_queue::entry* q = (ast_balancing_queue::entry*)alloca(total_nodes * sizeof(ast_balancing_queue::entry));
+		leaf_binary_heap.init(q, total_nodes);
+	}
+
+	nodes_to_process.push(_root->binary_op.left);
+	nodes_to_process.push(_root->binary_op.right);
+
+	ast_node_type const required_binary_op = _root->type;
+
+	ast_node* popped_node;
+	while (nodes_to_process.pop(&popped_node))
+	{
+		if (_node_info[popped_node->node_id].is_root)
+		{
+			// Balance this root first, seperately.
+			do_balance_tree(_expr, _node_info, popped_node);
+			leaf_binary_heap.push(popped_node, _node_info[popped_node->node_id].weight);
+		}
+		else if(popped_node->type == required_binary_op)
+		{
+			ast_node* left = popped_node->binary_op.left;
+			ast_node* right = popped_node->binary_op.right;
+
+			// free the popped node, we will allocate a new node later.
+			// Set type to invalid so we don't free children.
+			popped_node->type = ast_node_type::invalid;
+			_expr->node_pool.free_node(popped_node);
+
+			nodes_to_process.push(left);
+			nodes_to_process.push(right);
+		}
+		else
+		{
+			int16_t const weight = popped_node->is_constant() ? 0 : 1;
+			leaf_binary_heap.push(popped_node, weight);
+		}
+	}
+
+	// Now rebuild the tree.
+
+	while (leaf_binary_heap.cur_entries)
+	{
+		ast_node* left_op = leaf_binary_heap.pop();
+		ast_node* right_op = leaf_binary_heap.pop();
+		EXPR_JIT_ASSERT(left_op && right_op);
+
+		ast_node* parent;
+	
+		if (leaf_binary_heap.cur_entries)
+		{
+			parent = _expr->alloc_ast_node();
+			parent->type = required_binary_op;
+
+			// Note: We are reading from fixed sized stack memory which is the maximum number of nodes previously in the tree.
+			// This is safe because the above call to alloc_ast_node will recycle previously freed binary nodes and the node_ids are recycled too.
+			// However it is still slightly sketchy and relies upon that implementation detail.
+			_node_info[parent->node_id].weight = _node_info[left_op->node_id].weight + _node_info[right_op->node_id].weight;
+		}
+		else
+		{
+			parent = _root;
+		}
+
+		parent->binary_op.left = left_op;
+		parent->binary_op.right = right_op;
+		left_op->parent = parent;
+		right_op->parent = parent;
+
+		if (leaf_binary_heap.cur_entries)
+		{
+			leaf_binary_heap.push(parent, _node_info[parent->node_id].weight);
+		}
+	}
+}
+
+static void optimize_balance_expression_trees(expr* _expr)
+{
+	// Given a tree of a similar form to:
+	// (eg addition / multiplication tree that is left / right associative)
+	//			+
+	//		/		\
+	//		1		+
+	//			/		\
+	//			2		+
+	//				/		\
+	//				3		+
+	//					/		\
+	//					4		var
+	//								etc.....
+
+	// we wish to transform it into something like this...
+	//				+	
+	//		/				\	<-- right branch can be folded.
+	//		var				+
+	//				/				\
+	//				+		  		+
+	//			/		\		/		\
+	//			1		2		3		4
+	//							
+
+	// We wish to balance said tree to remove instruction dependencies (improve ILP) and introduce opportunities for constant folding.
+
+	uint32_t const total_nodes = _expr->node_pool.total_nodes;
+	balancing_node_info* node_info = (balancing_node_info*)alloca(total_nodes * sizeof(balancing_node_info));
+
+	for (uint32_t i = 0; i < total_nodes; ++i)
+	{
+		node_info[i].is_root = false;
+		node_info[i].weight = -1;
+	}
+
+	ast_balancing_queue tree_roots;
+	{
+		ast_balancing_queue::entry* q = (ast_balancing_queue::entry*)alloca(total_nodes * sizeof(ast_balancing_queue::entry));
+		tree_roots.init(q, total_nodes);
+	}
+
+	// First determine potential roots of optimizable sub trees.
+	// A node is a root iff it is a commutative and associative binary operator and its parent is a different operator.
+	// For example all of the addition nodes in the above comment would be roots
+
+	visit_ast_depth_first_post_order(_expr->root, [&tree_roots](ast_node* _node)
+	{
+		EXPR_JIT_ASSERT(_node->node_id < tree_roots.max_entries);
+		// Identify this as a root of an optimizable expression tree.
+		if (_node->is_binary_op() && is_bin_op_associative(_node->type) && is_bin_op_commutative(_node->type)
+			&& (!_node->parent || _node->parent->type != _node->type)
+			)
+		{
+			tree_roots.push(_node, int32_t(_node->op_precedence()));
+		}
+	});
+
+	while (ast_node* next_root = tree_roots.pop())
+	{
+		do_balance_tree(_expr, node_info, next_root);
+	}
+}
+
 expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= nullptr*/, alloc_hooks* _alloc_hooks /*= nullptr*/)
 {
 	alloc_hooks hooks;
@@ -989,6 +1376,7 @@ expr* parse_expression(expression_info const& _info, error_cb _error_cb /*= null
 		return nullptr;
 	}
 	
+	optimize_balance_expression_trees(expression);
 	optimize_fold_constants(expression->root, expression);
 	optimize_strength_reduction(expression->root);
 
@@ -1726,7 +2114,6 @@ static void jit_expr_x64_build_from_ast(x64_writer_ctx& _writer, ast_node* _node
 					jit_expr_x64_build_from_ast(_writer, _node->function.params[0], _dest);
 					operand_location const_loc;
 					const_loc.set_as_constant(_writer.get_constant_index_128(c_sign_mask));
-					// use andnot to potentially reuse sign bit in a register (need to implement that).
 					x64_and_ps(_writer, _dest, const_loc);
 				} break;
 
